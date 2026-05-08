@@ -1,0 +1,96 @@
+#!/bin/sh
+# wifi-connect — bring up wlan0 against the on-board ESP32-C6 over esp-hosted-NG.
+#
+# Usage:   wifi-connect [SSID [PSK]]
+#
+# NOMMU-aware: every fork+exec rounds the binary's text+data+bss+stack
+# up to the next power of two, then alloc-as-one-contiguous-region from
+# the buddy heap. busybox is built under 512 KB so each shell-applet
+# load is an order-7 (512 KB) FLAT alloc, and we keep wpa_supplicant
+# under 1 MB so it loads as order-8 (1 MB). Without those size cuts no
+# 2 MB block ever exists at boot in the 32 MB PSRAM heap and the whole
+# script fails on the first wpa_supplicant exec.
+#
+# The shell is hush; printf, echo, [, kill, read, case, for, while are
+# builtins (zero fork). The script keeps explicit rc checks + buddyinfo
+# dumps bracketing each fork point so failures point at the offender.
+
+CONF=/tmp/wpa_supplicant.conf
+IFACE=wlan0
+
+SSID="${1:-}"
+PSK="${2:-}"
+
+if [ -z "$SSID" ]; then
+    printf 'SSID: '
+    read -r SSID
+fi
+if [ -z "$PSK" ]; then
+    printf 'Passphrase: '
+    stty -echo
+    read -r PSK
+    stty echo
+    printf '\n'
+fi
+
+dump_buddy() {
+    printf '[wifi] %s — buddyinfo / mem free:\n' "$1"
+    while read -r line; do
+        printf '  %s\n' "$line"
+    done < /proc/buddyinfo
+    while read -r line; do
+        case "$line" in
+            MemTotal:*|MemFree:*|MemAvailable:*|Slab:*|Unevictable:*|VmallocUsed:*)
+                printf '  %s\n' "$line" ;;
+        esac
+    done < /proc/meminfo
+}
+
+dump_buddy 'pre-conf'
+
+# Build wpa_supplicant.conf via hush printf builtin (zero fork).
+umask 077
+printf '%s\n' \
+    'ctrl_interface=/var/run/wpa_supplicant' \
+    'update_config=1' \
+    'network={' \
+    "    ssid=\"${SSID}\"" \
+    "    psk=\"${PSK}\"" \
+    '    key_mgmt=WPA-PSK' \
+    '}' > "$CONF"
+rc=$?
+printf '[wifi] wrote %s rc=%d\n' "$CONF" "$rc"
+[ "$rc" -eq 0 ] || { printf '[wifi] FAILED writing %s\n' "$CONF"; exit 1; }
+
+dump_buddy 'pre-iplink'
+ip link set "$IFACE" up
+rc=$?
+printf '[wifi] ip link set up rc=%d\n' "$rc"
+[ "$rc" -eq 0 ] || { printf '[wifi] FAILED ip link set up\n'; exit 1; }
+
+dump_buddy 'pre-wpa'
+wpa_supplicant -B -i "$IFACE" -D nl80211 -c "$CONF"
+rc=$?
+printf '[wifi] wpa_supplicant -B rc=%d\n' "$rc"
+[ "$rc" -eq 0 ] || { printf '[wifi] FAILED wpa_supplicant\n'; exit 1; }
+
+# Wait for wpa to finish associating before forking udhcpc. The
+# association burst (auth → assoc → 4-way handshake, ~6s on this
+# C6 SPI link) allocates skbs from the buddy and fragments any
+# remaining 1 MB block, leaving udhcpc with no contiguous region
+# to load into. Poll operstate via builtin file read; sleep 1 is
+# a transient 1 MB FLAT fork but the page returns to the buddy on
+# exit. Wait up to ~16s.
+state=dormant
+i=0
+while [ $i -lt 16 ]; do
+    sleep 1
+    read -r state < /sys/class/net/"$IFACE"/operstate
+    [ "$state" = "up" ] && break
+    i=$((i+1))
+done
+printf '[wifi] operstate after %ds: %s\n' "$i" "$state"
+
+dump_buddy 'pre-udhcpc'
+printf '[wifi] requesting DHCP lease...\n'
+exec udhcpc -i "$IFACE" -n -q -t 30 -A 3

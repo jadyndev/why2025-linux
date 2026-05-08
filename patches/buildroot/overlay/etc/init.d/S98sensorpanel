@@ -1,0 +1,71 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+# S98sensorpanel — start the live BME680 + BMI270 readout on the panel.
+#
+# Off by default. Touch /etc/sensorpanel.enable to opt in; the script
+# short-circuits otherwise.
+#
+# When enabled, on boot:
+#   1. wait for /dev/fb0 (DSI bring-up + 3 s deferred fbdev setup)
+#   2. wait for BMI270 to enumerate (driver retries the firmware load
+#      itself once the rootfs is mounted — see patch 0009)
+#   3. silence kernel printk + unbind fbcon so the panel is the
+#      renderer's exclusively
+#   4. exec /usr/bin/sensorpanel in the background
+#
+# fbcon binding survives a sensorpanel crash, so if the demo ever segv's
+# the panel goes back to showing kmsg rather than freezing on stale
+# pixels — that's the desired behaviour for an unattended demo.
+
+case "$1" in
+    start|"")
+        ;;
+    stop)
+        # Re-bind fbcon so the screen is usable again, kill the renderer.
+        echo 1 > /sys/class/vtconsole/vtcon1/bind 2>/dev/null
+        killall sensorpanel 2>/dev/null
+        exit 0
+        ;;
+    *)
+        exit 0
+        ;;
+esac
+
+(
+    # Auto-launch is gated on /etc/sensorpanel.enable so we can debug
+    # the renderer interactively without rebooting into a wedge if it
+    # crashes. When the gate is closed we do NOTHING here — kmsg stays
+    # at boot loglevel, fbcon stays attached, panel keeps showing the
+    # boot console. Once the binary is solid, drop the gate.
+    [ -e /etc/sensorpanel.enable ] || exit 0
+
+    # Wait up to ~10 s for /dev/fb0.
+    i=0
+    while [ ! -e /dev/fb0 ] && [ $i -lt 50 ]; do
+        usleep 200000; i=$((i+1))
+    done
+    [ ! -e /dev/fb0 ] && exit 0
+
+    # Wait up to ~8 s for BMI270 to finish enumerating. The kernel
+    # driver does its own delayed-work retry of the firmware load (see
+    # patch 0009) so we just poll for iio:device1 to appear. Launching
+    # while the I²C upload is still in flight competes with our own
+    # I²C-via-sysfs polling on the same bus and has been observed to
+    # wedge the badge.
+    i=0
+    while [ ! -e /sys/bus/iio/devices/iio:device1/name ] && [ $i -lt 40 ]; do
+        usleep 200000; i=$((i+1))
+    done
+
+    # Quiet kernel printk so anything chatty post-boot doesn't leak onto
+    # ttyS0 mid-demo; loglevel=8 in CMDLINE is too verbose for a kiosk.
+    dmesg -n 1 2>/dev/null
+
+    # Unbind framebuffer console — fbcon stops drawing the cursor /
+    # printk on /dev/fb0 the moment we exec sensorpanel.
+    echo 0 > /sys/class/vtconsole/vtcon1/bind 2>/dev/null
+
+    exec /usr/bin/sensorpanel >/tmp/sp.log 2>&1
+) &
+
+exit 0

@@ -1,0 +1,43 @@
+# Build artifacts
+build/
+output/
+dist/
+*.o
+*.a
+*.elf
+*.bin
+*.map
+
+# ESP-IDF auto-generated
+sdkconfig
+sdkconfig.old
+managed_components/
+dependencies.lock
+
+# Editor / OS noise
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+
+# Buildroot tree at the repo root (cloned separately, never checked in).
+# Anchored with a leading slash so it doesn't accidentally match
+# patches/buildroot/.
+/buildroot/
+
+# FLAT userspace binaries — build from patches/buildroot/overlay-src/
+patches/buildroot/overlay/usr/bin/ble_scan
+patches/buildroot/overlay/usr/bin/hci_up
+patches/buildroot/overlay/usr/bin/sensorpanel
+patches/buildroot/overlay/usr/bin/sensorpanel.gdb
+patches/buildroot/overlay/usr/bin/*.gdb
+# wifi-connect is a shell script — keep it
+
+# Test logs
+*.log
+freezetest/
+loadtest/
+heartbeat/
+greptest/
+grepbisect/

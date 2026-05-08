@@ -1,0 +1,23 @@
+export PATH="/bin:/sbin:/usr/bin:/usr/sbin"
+
+# WHY2025 NOMMU: avoid the `id -u` backtick the default Buildroot profile
+# uses. Under memory pressure that fork+exec can fail; the empty
+# substitution then turns `[ "" -eq 0 ]` into a parser error and the
+# login shell exits with "syntax error: unexpected E", looping getty.
+# Use $USER (set by login) or $LOGNAME instead — no fork needed.
+if [ "$PS1" ]; then
+    if [ "$USER" = "root" ] || [ "$LOGNAME" = "root" ]; then
+        export PS1='# '
+    else
+        export PS1='$ '
+    fi
+fi
+
+export EDITOR='/bin/vi'
+
+for i in /etc/profile.d/*.sh ; do
+    if [ -r "$i" ]; then
+        . $i
+    fi
+done
+unset i

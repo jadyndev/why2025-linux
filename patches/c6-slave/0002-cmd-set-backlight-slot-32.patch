@@ -1,0 +1,65 @@
+--- a/main/include/cmd.h	2026-05-07 18:53:47.788662523 +0200
++++ b/main/include/cmd.h	2026-05-05 17:00:17.000000000 +0200
+@@ -60,6 +60,7 @@
+ int process_ota_start(uint8_t if_type, uint8_t *payload, uint16_t payload_len);
+ int process_ota_write(uint8_t if_type, uint8_t *payload, uint16_t payload_len);
+ int process_ota_end(uint8_t if_type, uint8_t *payload, uint16_t payload_len);
++int process_set_backlight(uint8_t if_type, uint8_t *payload, uint16_t payload_len);
+ 
+ esp_err_t initialise_wifi(void);
+ 
+--- a/main/include/adapter.h	2026-05-07 18:53:47.786393400 +0200
++++ b/main/include/adapter.h	2026-05-05 16:59:38.000000000 +0200
+@@ -157,6 +157,7 @@
+ 	CMD_START_OTA_UPDATE = 29,
+ 	CMD_START_OTA_WRITE = 30,
+ 	CMD_START_OTA_END = 31,
++	CMD_SET_BACKLIGHT = 32,
+ 	CMD_MAX,
+ };
+ 
+@@ -193,6 +194,12 @@
+ 	char       ota_binary[];
+ } __packed;
+ 
++struct cmd_set_backlight {
++	struct command_header header;
++	uint8_t    brightness;
++	uint8_t    pad[3];
++} __packed;
++
+ struct scan_request {
+ 	struct     command_header header;
+ 	uint8_t    bssid[MAC_ADDR_LEN];
+--- a/main/cmd.c	2026-05-07 18:53:47.789852231 +0200
++++ b/main/cmd.c	2026-05-05 17:01:01.000000000 +0200
+@@ -30,6 +30,7 @@
+ #include "esp_ota_ops.h"
+ #include "esp_app_format.h"
+ #include "freertos/event_groups.h"
++#include "driver/ledc.h"
+ 
+ #define TAG "FW_CMD"
+ 
+@@ -1231,6 +1232,21 @@
+     return send_command_resp(if_type, CMD_SET_TIME, CMD_RESPONSE_SUCCESS, NULL, 0, 0);
+ }
+ 
++/* CMD_SET_BACKLIGHT: drive the display backlight LEDC channel (set up by
++ * why2025_backlight_init() at boot) to a raw 0..255 duty supplied by the
++ * host. Keyboard backlight stays at its slave-side default; the host has
++ * no control over channel 1 by design.
++ */
++int process_set_backlight(uint8_t if_type, uint8_t *payload, uint16_t payload_len)
++{
++    struct cmd_set_backlight *cmd = (struct cmd_set_backlight *)payload;
++
++    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, cmd->brightness);
++    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
++
++    return send_command_resp(if_type, CMD_SET_BACKLIGHT, CMD_RESPONSE_SUCCESS, NULL, 0, 0);
++}
++
+ int process_reg_set(uint8_t if_type, uint8_t *payload, uint16_t payload_len)
+ {
+     struct cmd_reg_domain *cmd;

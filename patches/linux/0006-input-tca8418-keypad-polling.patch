@@ -1,0 +1,65 @@
+--- a/drivers/input/keyboard/tca8418_keypad.c	2026-04-30 11:13:53.000000000 +0200
++++ b/drivers/input/keyboard/tca8418_keypad.c	2026-05-05 11:14:25.104537941 +0200
+@@ -229,6 +229,17 @@
+ }
+ 
+ /*
++ * Polling fallback for boards that don't wire the TCA8418 NOT pin.
++ * The KEY FIFO is the same ground truth; we just drain it on a timer
++ * instead of an interrupt. INT_STAT housekeeping is unnecessary when
++ * no host IRQ line exists, so this is strictly read-keypad on tick.
++ */
++static void tca8418_poll(struct input_dev *input)
++{
++	tca8418_read_keypad(input_get_drvdata(input));
++}
++
++/*
+  * Configure the TCA8418 for keypad operation
+  */
+ static int tca8418_configure(struct tca8418_keypad *keypad_data,
+@@ -327,15 +338,36 @@
+ 		__set_bit(EV_REP, input->evbit);
+ 
+ 	input_set_capability(input, EV_MSC, MSC_SCAN);
++	input_set_drvdata(input, keypad_data);
+ 
+-	error = devm_request_threaded_irq(dev, client->irq,
+-					  NULL, tca8418_irq_handler,
+-					  IRQF_SHARED | IRQF_ONESHOT,
+-					  client->name, keypad_data);
+-	if (error) {
+-		dev_err(dev, "Unable to claim irq %d; error %d\n",
+-			client->irq, error);
+-		return error;
++	if (client->irq > 0) {
++		error = devm_request_threaded_irq(dev, client->irq,
++						  NULL, tca8418_irq_handler,
++						  IRQF_SHARED | IRQF_ONESHOT,
++						  client->name, keypad_data);
++		if (error) {
++			dev_err(dev, "Unable to claim irq %d; error %d\n",
++				client->irq, error);
++			return error;
++		}
++	} else {
++		/*
++		 * No INT line wired (e.g. WHY2025 badge). Poll the FIFO
++		 * instead. 50 ms default trades latency vs. I2C bus load;
++		 * an explicit "poll-interval" property in the DT node
++		 * overrides.
++		 */
++		u32 poll_interval = 50;
++
++		device_property_read_u32(dev, "poll-interval", &poll_interval);
++		error = input_setup_polling(input, tca8418_poll);
++		if (error) {
++			dev_err(dev, "Unable to set up polling: %d\n", error);
++			return error;
++		}
++		input_set_poll_interval(input, poll_interval);
++		dev_info(dev, "tca8418: polling at %u ms (no IRQ)\n",
++			 poll_interval);
+ 	}
+ 
+ 	/* Initialize the chip */

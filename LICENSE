@@ -1,0 +1,29 @@
+This project is a collection of components with mixed licenses. Each
+file carries its own SPDX-License-Identifier where applicable. The
+overall project is distributed as follows:
+
+  - Linux kernel patches under patches/linux/  — GPL-2.0
+  - Boot shim under linux-native/              — Apache-2.0 OR GPL-2.0
+  - C6 slave fork under c6-slave/              — Apache-2.0 OR GPL-2.0
+    (inherited from upstream esp-hosted-ng)
+  - Tools under tools/                         — MIT
+  - Buildroot overlay scripts                  — GPL-2.0
+  - Docs                                       — CC-BY-4.0
+
+The combined work, when distributed together, is GPL-2.0 because the
+kernel patches dominate the licensing footprint.
+
+----
+
+GPL-2.0 license text follows.
+
+                    GNU GENERAL PUBLIC LICENSE
+                       Version 2, June 1991
+
+ Copyright (C) 1989, 1991 Free Software Foundation, Inc.
+ 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA
+
+ Everyone is permitted to copy and distribute verbatim copies
+ of this license document, but changing it is not allowed.
+
+(Full text: https://www.gnu.org/licenses/old-licenses/gpl-2.0.txt)

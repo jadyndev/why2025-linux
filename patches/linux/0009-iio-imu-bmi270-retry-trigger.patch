@@ -1,0 +1,68 @@
+--- a/drivers/iio/imu/bmi270/bmi270_core.c	2026-04-30 11:13:53.000000000 +0200
++++ b/drivers/iio/imu/bmi270/bmi270_core.c	2026-05-07 08:54:19.607192887 +0200
+@@ -7,6 +7,16 @@
+ #include <linux/mutex.h>
+ #include <linux/regmap.h>
+ #include <linux/units.h>
++#include <linux/workqueue.h>
++
++/*
++ * Forward-declare driver_deferred_probe_trigger() — drivers/base/dd.c
++ * doesn't EXPORT_SYMBOL it, but it's a built-in function in the kernel
++ * proper, so a built-in driver can call it directly. We use it below
++ * to retry our probe after a delay when /lib/firmware isn't available
++ * yet at first probe time.
++ */
++extern void driver_deferred_probe_trigger(void);
+ 
+ #include <linux/iio/events.h>
+ #include <linux/iio/iio.h>
+@@ -1142,6 +1152,34 @@
+ 	return 0;
+ }
+ 
++/*
++ * BMI270 firmware-load retry machinery.
++ *
++ * On platforms where /lib/firmware ships in the rootfs (squashfs-on-mtd-rom
++ * for the WHY2025 badge), built-in drivers probe before prepare_namespace()
++ * mounts root, so request_firmware() returns -ENOENT. Returning -EPROBE_DEFER
++ * alone isn't enough: deferred_probe_work only re-runs when *another* driver
++ * binds, and after all initial probes settle the queue goes idle. We
++ * schedule a one-shot delayed_work that calls driver_deferred_probe_trigger()
++ * to force a re-test once rootfs is up. Bounded retries so a permanently
++ * absent firmware blob doesn't loop forever.
++ */
++#define BMI270_FW_MAX_RETRIES		6
++/*
++ * 5 s delay deliberately overshoots the 4-9 s deferred_probe + DSI bring-up
++ * window. Probing earlier than that would put the 8 KB I²C-gpio firmware
++ * upload (~640 ms) right back in the heap-fragmentation / SPI-race window
++ * that wrecked boot reliability under the old S05bmi270 sysfs-rebind path.
++ */
++#define BMI270_FW_RETRY_DELAY_MS	5000
++
++static int bmi270_fw_retry_count;
++static void bmi270_fw_retry_fn(struct work_struct *work)
++{
++	driver_deferred_probe_trigger();
++}
++static DECLARE_DELAYED_WORK(bmi270_fw_retry_work, bmi270_fw_retry_fn);
++
+ static int bmi270_write_calibration_data(struct bmi270_data *data)
+ {
+ 	int ret;
+@@ -1170,6 +1208,13 @@
+ 				     "Failed to prepare device to load init data");
+ 
+ 	ret = request_firmware(&init_data, data->chip_info->fw_name, dev);
++	if (ret == -ENOENT &&
++	    bmi270_fw_retry_count < BMI270_FW_MAX_RETRIES) {
++		bmi270_fw_retry_count++;
++		schedule_delayed_work(&bmi270_fw_retry_work,
++				      msecs_to_jiffies(BMI270_FW_RETRY_DELAY_MS));
++		return -EPROBE_DEFER;
++	}
+ 	if (ret)
+ 		return dev_err_probe(dev, ret, "Failed to load init data file");
+ 

@@ -1,0 +1,1933 @@
+--- a/drivers/gpu/drm/Kconfig	2026-04-30 11:13:53.000000000 +0200
++++ b/drivers/gpu/drm/Kconfig	2026-05-05 11:14:25.080678369 +0200
+@@ -331,6 +331,7 @@
+ source "drivers/gpu/drm/tegra/Kconfig"
+ 
+ source "drivers/gpu/drm/stm/Kconfig"
++source "drivers/gpu/drm/espressif/Kconfig"
+ 
+ source "drivers/gpu/drm/panel/Kconfig"
+ 
+--- a/drivers/gpu/drm/Makefile	2026-04-30 11:13:53.000000000 +0200
++++ b/drivers/gpu/drm/Makefile	2026-05-05 11:14:25.080797036 +0200
+@@ -234,6 +234,7 @@
+ obj-$(CONFIG_DRM_SPRD) += sprd/
+ obj-$(CONFIG_DRM_LOONGSON) += loongson/
+ obj-$(CONFIG_DRM_POWERVR) += imagination/
++obj-$(CONFIG_DRM_ESP32P4) += espressif/
+ 
+ # Ensure drm headers are self-contained and pass kernel-doc
+ hdrtest-files := \
+--- a/drivers/gpu/drm/bridge/synopsys/dw-mipi-dsi.c	2026-04-30 11:13:53.000000000 +0200
++++ b/drivers/gpu/drm/bridge/synopsys/dw-mipi-dsi.c	2026-05-05 11:14:25.096040874 +0200
+@@ -273,6 +273,7 @@
+ 	const struct dw_mipi_dsi_plat_data *plat_data;
+ };
+ 
++
+ /*
+  * Check if either a link to a master or slave is present
+  */
+@@ -1048,12 +1049,40 @@
+ {
+ 	struct dw_mipi_dsi *dsi = bridge_to_dsi(bridge);
+ 
++	/*
++	 * If the glue driver needs panel DCS to run in command mode before
++	 * the host switches to video, skip the VIDEO transition here. The
++	 * glue calls dw_mipi_dsi_late_enable_video() once panel init is done.
++	 */
++	if (dsi->plat_data->defer_video_mode_switch) {
++		dev_info(dsi->dev,
++			 "atomic_enable: deferring set_mode(VIDEO); glue will call late_enable_video\n");
++		return;
++	}
++
+ 	/* Switch to video mode for panel-bridge enable & panel enable */
+ 	dw_mipi_dsi_set_mode(dsi, MIPI_DSI_MODE_VIDEO);
+ 	if (dsi->slave)
+ 		dw_mipi_dsi_set_mode(dsi->slave, MIPI_DSI_MODE_VIDEO);
+ }
+ 
++/*
++ * Deferred VIDEO-mode switch — glue-driver entry point used when
++ * plat_data->defer_video_mode_switch is true. Invokes the same set_mode
++ * path atomic_enable would have taken, so the DW host's internal state
++ * (video_mode_config, LPCLK_CTRL, PWR_UP sequencing) matches what the
++ * upstream flow produces. Call this AFTER panel DCS init has completed.
++ */
++void dw_mipi_dsi_late_enable_video(struct dw_mipi_dsi *dsi)
++{
++	/* TODO: remove before upstream — v4 instrumentation */
++	dev_info(dsi->dev, "late_enable_video: transitioning to VIDEO mode\n");
++	dw_mipi_dsi_set_mode(dsi, MIPI_DSI_MODE_VIDEO);
++	if (dsi->slave)
++		dw_mipi_dsi_set_mode(dsi->slave, MIPI_DSI_MODE_VIDEO);
++}
++EXPORT_SYMBOL_GPL(dw_mipi_dsi_late_enable_video);
++
+ static enum drm_mode_status
+ dw_mipi_dsi_bridge_mode_valid(struct drm_bridge *bridge,
+ 			      const struct drm_display_info *info,
+--- a/include/drm/bridge/dw_mipi_dsi.h	2026-04-30 11:13:53.000000000 +0200
++++ b/include/drm/bridge/dw_mipi_dsi.h	2026-05-05 11:14:25.095835082 +0200
+@@ -74,6 +74,17 @@
+ 	const struct dw_mipi_dsi_host_ops *host_ops;
+ 
+ 	void *priv_data;
++
++	/*
++	 * If true, dw_mipi_dsi_bridge_atomic_enable() will NOT call
++	 * dw_mipi_dsi_set_mode(VIDEO). The glue driver is then responsible
++	 * for calling dw_mipi_dsi_late_enable_video() at the right moment —
++	 * typically after panel DCS init has completed in CMD mode. Used by
++	 * SoCs whose panel init sequence must run in command mode before any
++	 * DPI sync is active (e.g., ESP32-P4, matching ESP-IDF's DBI-before-
++	 * DPI flow).
++	 */
++	bool defer_video_mode_switch;
+ };
+ 
+ struct dw_mipi_dsi *dw_mipi_dsi_probe(struct platform_device *pdev,
+@@ -84,5 +95,6 @@
+ void dw_mipi_dsi_unbind(struct dw_mipi_dsi *dsi);
+ void dw_mipi_dsi_set_slave(struct dw_mipi_dsi *dsi, struct dw_mipi_dsi *slave);
+ struct drm_bridge *dw_mipi_dsi_get_bridge(struct dw_mipi_dsi *dsi);
++void dw_mipi_dsi_late_enable_video(struct dw_mipi_dsi *dsi);
+ 
+ #endif /* __DW_MIPI_DSI__ */
+--- /dev/null	2026-05-03 14:38:22.219445125 +0200
++++ b/drivers/gpu/drm/espressif/Kconfig	2026-05-05 11:14:25.126215591 +0200
+@@ -0,0 +1,24 @@
++# SPDX-License-Identifier: GPL-2.0
++config DRM_ESP32P4
++	tristate "DRM support for Espressif ESP32-P4"
++	depends on DRM && (SOC_ESP32P4 || COMPILE_TEST)
++	depends on OF
++	select DRM_CLIENT_SELECTION
++	select DRM_KMS_HELPER
++	select DRM_GEM_DMA_HELPER
++	select DRM_PANEL_BRIDGE
++	select DRM_MIPI_DSI
++	select DRM_DW_MIPI_DSI
++	select VIDEOMODE_HELPERS
++	help
++	  DRM/KMS driver for the MIPI-DSI display subsystem of the
++	  Espressif ESP32-P4 SoC. Wraps the Synopsys DW-MIPI-DSI host IP
++	  with the ESP32-P4-specific bridge glue (DPI output enable,
++	  video-timing shadow registers, DMA feed, MODE_CFG quirk).
++
++	  Needed on the WHY2025 hacker badge to drive the 720x720
++	  Sitronix ST7703 panel. Say N if unsure.
++
++	  To compile as a module choose M; the module will be called
++	  dw-mipi-dsi-esp32p4. (Module builds require CONFIG_MODULES=y;
++	  the esp32p4_defconfig currently builds everything in.)
+--- /dev/null	2026-05-03 14:38:22.219445125 +0200
++++ b/drivers/gpu/drm/espressif/Makefile	2026-05-05 11:14:25.080415243 +0200
+@@ -0,0 +1,2 @@
++# SPDX-License-Identifier: GPL-2.0
++obj-$(CONFIG_DRM_ESP32P4) += dw-mipi-dsi-esp32p4.o
+--- /dev/null	2026-05-03 14:38:22.219445125 +0200
++++ b/drivers/gpu/drm/espressif/dw-mipi-dsi-esp32p4.c	2026-05-05 11:14:25.131337357 +0200
+@@ -0,0 +1,1800 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Espressif ESP32-P4 MIPI-DSI glue driver —
++ *
++ * Wraps the Synopsys DW-MIPI-DSI host IP with the Espressif bridge glue.
++ *
++ * Gate 5c (current): full DRM modeset path. Registers a drm_device, a
++ * drm_simple_display_pipe (one plane, one CRTC, one encoder), and attaches
++ * the DW-MIPI-DSI bridge. pipe_enable programs the Espressif DPI bridge and
++ * enables DPI output 400 ms after the panel DCS init completes. Expected
++ * result: C6 detects HS traffic → backlight on → underrun fill colour on
++ * screen (DW-GDMA not yet wired; comes in the next gate).
++ *
++ * Still unimplemented (next gate):
++ *   - DW-GDMA descriptor chain feeding CMA framebuffer → real pixels.
++ *   - Element-order mux (Finding #3; RGB vs BGR byte swap).
++ *   - Proper esp32p4-clk / esp32p4-ldo DT driver replacements for the
++ *     direct register pokes in clkrst_audit() and ldo3_enable().
++ *
++ * Target path in-tree: drivers/gpu/drm/espressif/dw-mipi-dsi-esp32p4.c.
++ *
++ * Reference: drivers/gpu/drm/stm/dw_mipi_dsi-stm.c.
++ */
++
++#include <linux/component.h>
++#include <linux/delay.h>
++#include <linux/dma-mapping.h>
++#include <linux/io.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/ratelimit.h>
++#include <linux/regulator/consumer.h>
++#include <linux/reset.h>
++
++#include <drm/bridge/dw_mipi_dsi.h>
++#include <drm/drm_atomic_helper.h>
++#include <drm/drm_bridge.h>
++#include <drm/drm_drv.h>
++#include <drm/drm_fb_helper.h>
++#include <drm/drm_fourcc.h>
++#include <drm/drm_framebuffer.h>
++#include <drm/drm_gem_dma_helper.h>
++#include <drm/drm_gem_framebuffer_helper.h>
++#include <drm/drm_managed.h>
++#include <drm/drm_mipi_dsi.h>
++#include <drm/drm_print.h>
++#include <drm/drm_fbdev_dma.h>
++#include <drm/clients/drm_client_setup.h>
++#include <drm/drm_probe_helper.h>
++#include <drm/drm_simple_kms_helper.h>
++
++/*
++ * HP_SYS_CLKRST registers that gate the MIPI-DSI subsystem. Taken from
++ * esp-idf/components/soc/esp32p4/register/hw_ver1/soc/hp_sys_clkrst_reg.h:
++ *
++ *   DR_REG_HP_SYS_CLKRST_BASE = DR_REG_HPPERIPH1_BASE (0x500C0000) + 0x26000
++ *                              = 0x500E6000
++ *   SOC_CLK_CTRL1        @ +0x18   bit 12: REG_DSI_SYS_CLK_EN
++ *   PERI_CLK_CTRL02      @ +0x38   PHY cfg-clock source select (not used here)
++ *   PERI_CLK_CTRL03      @ +0x3C   bit 0: DSI_DPHY_CFG_CLK_EN
++ *                                  bit 1: DSI_DPHY_PLL_REFCLK_EN
++ *   HP_RST_EN0           @ +0xC0   bit 26: RST_EN_DSI_BRG (pulse 1→0)
++ *
++ * On a real upstream port this belongs in a P4 clock-controller driver
++ * exposing clk/reset handles via DT; for now we poke the bits directly so
++ * we can answer "is the DSI peripheral even clocked?" without waiting on
++ * that driver.
++ */
++#define ESP32P4_HP_SYS_CLKRST_BASE	0x500E6000
++#define ESP32P4_HP_SYS_CLKRST_SIZE	0x1000
++
++#define HP_SYS_CLKRST_SOC_CLK_CTRL0	0x14
++#define  GDMA_CPU_CLK_EN		BIT(13)	/* DW-GDMA CPU/AHB clock */
++#define HP_SYS_CLKRST_SOC_CLK_CTRL1	0x18
++#define  GDMA_SYS_CLK_EN		BIT(5)	/* DW-GDMA sys clock */
++#define  DMA2D_SYS_CLK_EN		BIT(6)	/* 2D DMA sys clock */
++#define  DSI_SYS_CLK_EN			BIT(12)
++#define HP_SYS_CLKRST_PERI_CLK_CTRL03	0x3C
++#define  DSI_DPHY_CFG_CLK_EN		BIT(0)
++#define  DSI_DPHY_PLL_REFCLK_EN		BIT(1)
++#define  DSI_DPICLK_SRC_SEL_SHIFT	5	/* bits [6:5]: DPI clk src */
++/*
++ * Per ESP-IDF mipi_dsi_ll.h:mipi_dsi_ll_set_dpi_clock_source(), the
++ * encoding for bits [6:5] is:
++ *   0 = XTAL (40 MHz)
++ *   1 = PLL_F240M  (default — what IDF uses for ST7703)
++ *   2 = PLL_F160M
++ *   3 = APLL
++ * Earlier code mis-named value 1 as PLL_F160M; for the BONO panel
++ * IDF uses PLL_F240M / 5 = 48 MHz (very close to panel-spec 47 MHz),
++ * matching its golden register dump.
++ */
++#define  DSI_DPICLK_SRC_PLL_F240M	(1u << 5)	/* value 1 */
++#define  DSI_DPICLK_SRC_PLL_F160M	(2u << 5)	/* value 2 (kept for ref) */
++#define  DSI_DPICLK_EN			BIT(7)	/* DPI clock enable */
++#define  DSI_DPICLK_DIV_NUM_SHIFT	8	/* bits [15:8]: divider */
++#define HP_SYS_CLKRST_HP_RST_EN0	0xC0
++#define  RST_EN_DSI_BRG			BIT(26)
++#define  RST_EN_GDMA			BIT(21)	/* DW-GDMA module reset */
++
++/*
++ * PMU external LDO channel 3 (MIPI DSI PHY analog supply, 2500 mV).
++ *
++ * Boot shim doesn't enable LDO3 (our gate 5a/5b "backlight" was the
++ * keyboard LED bleed-through; the DSI PHY's analog section never had
++ * power). Without this, the PHY's digital register block is reachable
++ * — hence readable PHY_STATUS bits — but the PLL will never lock and
++ * writes to PHY_RSTZ do not unstick the status.
++ *
++ * Register layout (hw_ver1/soc/pmu_reg.h):
++ *   DR_REG_PMU_BASE       = DR_REG_LPAON_BASE (0x50110000) + 0x5000
++ *                         = 0x50115000
++ *   P0_0P2A_REG     @ +0x1c0  (ext_ldo[1] = LDO unit 2 = channel 3)
++ *     bit  7      FORCE_TIEH_SEL   (1 = SW-owned)
++ *     bit  8      XPD              (1 = enable)
++ *     bits 11:9   TIEH_SEL         (0 = use tieh)
++ *     bit 14      TIEH             (0 = Vref*Mul, not 3.3V bypass)
++ *   P0_0P2A_ANA_REG @ +0x1c4
++ *     bits 25:23  MUL
++ *     bit 26      EN_VDET          (ripple suppression)
++ *     bits 31:28  DREF
++ *
++ * For 2500 mV with no-eFuse-calibration fallback math (matches
++ * ldo_ll_voltage_to_dref_mul): DREF=9, MUL=6. Verified in Python.
++ *
++ * This belongs in a proper P4 LDO regulator driver; putting it here is
++ * diagnostic-only, just to answer "does the PHY PLL actually lock once
++ * analog supply exists." If this lights up PHY_STATUS.PHY_LOCK, the
++ * regulator-fixed stub in our DTS is a lie and needs replacing.
++ */
++#define ESP32P4_PMU_BASE		0x50115000
++#define ESP32P4_PMU_SIZE		0x1000
++#define PMU_EXT_LDO_P0_0P2A_REG		0x1c0
++#define PMU_EXT_LDO_P0_0P2A_ANA_REG	0x1c4
++#define  PMU_0P2A_FORCE_TIEH_SEL	BIT(7)
++#define  PMU_0P2A_XPD			BIT(8)
++#define  PMU_0P2A_TIEH_SEL_MASK		(0x7 << 9)
++#define  PMU_0P2A_TIEH			BIT(14)
++#define  PMU_ANA_0P2A_MUL_SHIFT		23
++#define  PMU_ANA_0P2A_MUL_MASK		(0x7 << PMU_ANA_0P2A_MUL_SHIFT)
++#define  PMU_ANA_0P2A_EN_VDET		BIT(26)
++#define  PMU_ANA_0P2A_DREF_SHIFT	28
++#define  PMU_ANA_0P2A_DREF_MASK		(0xF << PMU_ANA_0P2A_DREF_SHIFT)
++
++/*
++ * Espressif bridge registers (offset from the "bridge" reg range base,
++ * DR_REG_DSI_BRG_BASE = 0x500A0800).
++ *
++ * Derived from ESP-IDF:
++ *   soc/esp32p4/register/hw_ver1/soc/mipi_dsi_bridge_reg.h (offsets)
++ *   hal/esp32p4/include/hal/mipi_dsi_brg_ll.h (bit field semantics)
++ *   esp_lcd/dsi/esp_lcd_panel_dpi.c (initialization sequence)
++ */
++/*
++ * DSI_BRG_CLK_EN (bridge offset 0x000) — bit 0: "force_on of dsi_bridge
++ * register clock gate". Default 0 = dynamically gated (APB access-only).
++ * Must be set to 1 before any DSI activity so the bridge's operational
++ * clock is always-on; without it the DW host FIFO drain stalls because
++ * the bridge never forwards packets to the PHY.
++ * Mirrors mipi_dsi_brg_ll_force_enable_reg_clock(dev, true) in IDF.
++ */
++#define DSI_BRG_CLK_EN		0x000	/* bit 0: force bridge clock always-on */
++#define DSI_BRG_EN		0x004	/* bit 0: module enable */
++#define DSI_BRG_DMA_REQ_CFG	0x008	/* bits [11:0]: dma_burst_len (64-bit words) */
++#define DSI_BRG_RAW_NUM_CFG	0x00c	/* bits [21:0]: raw_num_total (pixel_bits/64)
++					 * bit  31: write 1 to reload counter */
++#define DSI_BRG_PIXEL_TYPE	0x018	/* bits [3:0]: raw_type (0=RGB888,1=RGB666,2=RGB565)
++					 * bits [5:4]: dpi_config
++					 * bit  6:    data_in_type (0=RGB,1=YUV) */
++#define  DSI_BRG_RAW_TYPE_RGB888	0u
++#define  DSI_BRG_RAW_TYPE_RGB565	2u
++#define DSI_BRG_DPI_V_CFG0	0x030	/* bits [11:0]: vtotal; bits [27:16]: vdisp */
++#define DSI_BRG_DPI_V_CFG1	0x034	/* bits [11:0]: vbank (=vbp); bits [27:16]: vsync (=vsw) */
++#define DSI_BRG_DPI_H_CFG0	0x038	/* bits [11:0]: htotal; bits [27:16]: hdisp */
++#define DSI_BRG_DPI_H_CFG1	0x03c	/* bits [11:0]: hbank (=hbp); bits [27:16]: hsync (=hsw) */
++#define DSI_BRG_DPI_MISC_CFG	0x040	/* bit  0:     dpi_en
++					 * bits [15:4]: fifo_underrun_discard_vcnt */
++#define DSI_BRG_DPI_CFG_UPDATE	0x044	/* write 1 to latch all DPI timing shadow registers */
++#define DSI_BRG_DMA_FLOW_CTRL	0x088	/* bit  0:    flow controller (0=DMA, 1=bridge)
++					 * bits [7:4]: multiblk_num */
++#define DSI_BRG_ALMOST_EMPTY_THRD 0x08c /* bits [10:0]: FIFO almost-empty threshold */
++
++/*
++ * DW-GDMA — IDF refers to this as "DW_GDMA" / "Generic DMA".
++ *
++ * Base 0x50081000 = DR_REG_HPPERIPH0_BASE (0x50000000) + 0x81000.
++ * Per-channel block at offset 0x100, 0x100 bytes/channel, 4 channels total.
++ *
++ * Bridge's DMA target ("memory address" of the bridge FIFO from the DMA's
++ * point of view): 0x50105000. DW-GDMA's master port 0 routes there; master
++ * port 1 routes to L2MEM/PSRAM. Per-channel CTL field 'sms' (src master
++ * select) and 'dms' (dst master select): 0 = MIPI_DSI bridge, 1 = memory.
++ *
++ * For our DSI feed: src = framebuffer in PSRAM (sms=1, sinc=INCR), dst =
++ * bridge FIFO at 0x50105000 (dms=0, dinc=FIXED). Handshake periph for DSI
++ * is ID 0 (DW_GDMA_LL_HW_HANDSHAKE_PERIPH_DSI per IDF dw_gdma_ll.h).
++ */
++#define ESP32P4_GDMA_BASE		0x50081000
++#define ESP32P4_GDMA_SIZE		0x500
++#define ESP32P4_DSI_BRG_MEM_BASE	0x50105000
++
++/*
++ * ESP32-P4 cache coherency for DMA buffers in PSRAM.
++ *
++ * Linux's arch_sync_dma_for_device() on this build is a NOP — it relies
++ * on Zicbom (cbo.clean) which our `-march=rv32imac` build doesn't have.
++ * The P4 has its own MMIO cache controller, exposed through ROM helpers
++ * at fixed addresses. We call them directly. Map bits: L1_DCACHE=BIT(4),
++ * L2_CACHE=BIT(5); we always pass 0x30 to flush both.
++ */
++#define ESP32P4_CACHE_MAP_L1D_L2	0x30
++typedef int (*esp32p4_cache_op_t)(u32 map, u32 addr, u32 size);
++#define esp32p4_cache_writeback ((esp32p4_cache_op_t)0x4fc003f4)
++#define esp32p4_cache_invalidate ((esp32p4_cache_op_t)0x4fc003e4)
++
++static inline void esp32p4_dsi_psram_flush(const void *vaddr, size_t size)
++{
++	esp32p4_cache_writeback(ESP32P4_CACHE_MAP_L1D_L2, (u32)vaddr, size);
++}
++static inline void esp32p4_dsi_psram_invalidate(const void *vaddr, size_t size)
++{
++	esp32p4_cache_invalidate(ESP32P4_CACHE_MAP_L1D_L2, (u32)vaddr, size);
++}
++
++/* Top-level GDMA registers */
++#define GDMA_CFG0			0x010	/* bit 0: dmac_en, bit 1: int_en */
++#define GDMA_CHEN0			0x018	/* bits[3:0] = ch_en, bits[11:8] = ch_en_we */
++#define GDMA_RESET0			0x058	/* bit 0: dmac_rst */
++
++/* Per-channel block: ESP32P4_GDMA_BASE + 0x100 + chan*0x100 + offset */
++#define GDMA_CH_OFFSET(chan)		(0x100 + (chan) * 0x100)
++#define GDMA_CH_SAR0			0x000
++#define GDMA_CH_SAR1			0x004
++#define GDMA_CH_DAR0			0x008
++#define GDMA_CH_DAR1			0x00c
++#define GDMA_CH_BLOCK_TS0		0x010	/* bits[21:0]: block_ts (N-1) */
++#define GDMA_CH_CTL0			0x018
++#define GDMA_CH_CTL1			0x01c
++#define GDMA_CH_CFG0			0x020
++#define GDMA_CH_CFG1			0x024
++#define GDMA_CH_LLP0			0x028
++#define GDMA_CH_LLP1			0x02c
++#define GDMA_CH_INTSTATENA0		0x080
++#define GDMA_CH_INTSTATENA1		0x084
++#define GDMA_CH_INTSIGENA0		0x090
++#define GDMA_CH_INTSIGENA1		0x094
++
++/* CFG0 bits — multi-block type encoding (per IDF dw_gdma_types.h):
++ *   0 = CONTIGUOUS, 1 = RELOAD, 2 = SHADOW, 3 = LIST.
++ * We want LIST (=3). Anything else and the engine ignores LLP and fires
++ * SHADOWREG_OR_LLI_INVALID_ERR (INT_ST0 bit 13). */
++#define GDMA_CFG0_SRC_MULTIBLK_LIST	(3u << 0)
++#define GDMA_CFG0_DST_MULTIBLK_LIST	(3u << 2)
++
++/* CFG1 bits */
++#define GDMA_CFG1_TT_FC_M2P_DMAC	1u		/* mem→periph, DMA itself is FC */
++#define GDMA_CFG1_TT_FC_M2P_DST		6u		/* mem→periph, dst is FC */
++#define GDMA_CFG1_HS_SEL_SRC_HW		(0u << 3)	/* HW handshake (default) */
++#define GDMA_CFG1_HS_SEL_DST_HW		(0u << 4)
++#define GDMA_CFG1_DST_PER_DSI		(0u << 12)	/* periph ID 0 = DSI */
++#define GDMA_CFG1_CH_PRIOR(p)		(((p) & 7u) << 17)
++#define GDMA_CFG1_SRC_OSR_LMT(n)	((((n) - 1) & 0xfu) << 23)
++#define GDMA_CFG1_DST_OSR_LMT(n)	((((n) - 1) & 0xfu) << 27)
++
++/* CTL0 bits (LLI control word low) */
++#define GDMA_CTL0_SMS_MEMORY		(1u << 0)
++#define GDMA_CTL0_DMS_DSI		(0u << 2)
++#define GDMA_CTL0_SINC_INCR		(0u << 4)
++#define GDMA_CTL0_DINC_FIXED		(1u << 6)
++#define GDMA_CTL0_TR_WIDTH_64		3u		/* 64-bit transfers */
++#define GDMA_CTL0_SRC_TR_WIDTH(w)	(((w) & 7u) << 8)
++#define GDMA_CTL0_DST_TR_WIDTH(w)	(((w) & 7u) << 11)
++#define GDMA_CTL0_MSIZE_512		9u
++#define GDMA_CTL0_MSIZE_256		8u
++#define GDMA_CTL0_SRC_MSIZE(m)		(((m) & 0xfu) << 14)
++#define GDMA_CTL0_DST_MSIZE(m)		(((m) & 0xfu) << 18)
++
++/* CTL1 bits (LLI control word high) */
++#define GDMA_CTL1_ARLEN_EN		BIT(6)
++#define GDMA_CTL1_ARLEN(n)		((((n) - 1) & 0xffu) << 7)
++#define GDMA_CTL1_AWLEN_EN		BIT(15)
++#define GDMA_CTL1_AWLEN(n)		((((n) - 1) & 0xffu) << 16)
++#define GDMA_CTL1_LLI_LAST		BIT(30)
++#define GDMA_CTL1_LLI_VALID		BIT(31)
++
++/* CHEN0 write-enable mask + value: enable channel N */
++#define GDMA_CHEN_ENABLE(chan)		((1u << (chan)) | (1u << (8 + (chan))))
++
++/*
++ * DW-GDMA Link List Item (LLI). Hardware-defined layout, 64 bytes,
++ * must be 64-byte aligned. We use the same layout as IDF's
++ * dw_gdma_link_list_item_t (defined in IDF's hal/dw_gdma_ll.h).
++ *
++ * For loop-forever single-LLI operation: set llp.loc = self_addr >> 6,
++ * ctl1.lli_valid = 1, ctl1.lli_last = 0. Engine reads LLI, executes,
++ * fetches next (which is self), reads again, executes... forever.
++ */
++struct esp32p4_gdma_lli {
++	u32 sar0, sar1;		/* source address, low/high */
++	u32 dar0, dar1;		/* dest address, low/high */
++	u32 block_ts0;		/* bits[21:0] = block_ts (N-1) */
++	u32 reserved_14;
++	u32 llp0, llp1;		/* link-list pointer (loc0 in bits[31:6], lms bit 0) */
++	u32 ctl0, ctl1;
++	u32 sstat;
++	u32 dstat;
++	u32 status0, status1;
++	u32 reserved_38, reserved_3c;
++} __aligned(64);
++
++/*
++ * DW-MIPI-DSI host registers written by our phy_power_on to override the
++ * LP-vs-HS command-mode configuration set by the DW bridge's own set_mode().
++ */
++#define DW_MIPI_DSI_CMD_MODE_CFG		0x068	/* per-packet LP/HS select */
++#define DW_MIPI_DSI_LPCLK_CTRL			0x094
++#define  LPCLK_TXREQUESTCLKHS			BIT(0)
++
++#define DW_MIPI_DSI_MODE_CFG			0x034
++#define DW_MIPI_DSI_MODE_CFG_VIDEO		0x0
++
++/*
++ * DW-MIPI-DSI host registers used to drive the D-PHY.
++ *
++ * Our phy_ops->init runs from inside the DW bridge driver, which brackets
++ * our callback with PHY_RSTZ / PHY_TST_CTRL0 sequencing of its own. All we
++ * do here is push PLL configuration bytes through the PHY test interface
++ * (see esp32p4_dsi_phy_write_reg below). The bridge then sets
++ * PHY_SHUTDOWNZ | PHY_RSTZ | PHY_ENABLECLK | PHY_FORCEPLL itself and polls
++ * PHY_STATUS for lock; we duplicate the lock poll in phy_power_on purely
++ * as a diagnostic, because "PLL never locked" vs "PLL locked but no HS
++ * traffic yet" are two very different failure modes and the bridge driver
++ * doesn't log which one it hit.
++ */
++#define DW_MIPI_DSI_PHY_RSTZ			0x0A0
++#define  PHY_RSTZ_SHUTDOWNZ			BIT(0)
++#define  PHY_RSTZ_RSTZ				BIT(1)
++#define  PHY_RSTZ_ENABLECLK			BIT(2)
++#define  PHY_RSTZ_FORCEPLL			BIT(3)
++#define DW_MIPI_DSI_PHY_IF_CFG			0x0A4
++#define DW_MIPI_DSI_PHY_STATUS			0x0B0
++#define  PHY_STATUS_PHY_LOCK			BIT(0)
++#define  PHY_STATUS_STOP_STATE_CLK_LANE		BIT(2)
++#define DW_MIPI_DSI_PHY_TST_CTRL0		0x0B4
++#define  PHY_TST_CTRL0_TESTCLK			BIT(1)
++#define  PHY_TST_CTRL0_TESTCLR			BIT(0)
++#define DW_MIPI_DSI_PHY_TST_CTRL1		0x0B8
++#define  PHY_TST_CTRL1_TESTEN			BIT(16)
++
++/*
++ * D-PHY PLL configuration for the BONO panel.
++ *
++ * ESP-IDF legacy default picks MIPI_DSI_PHY_PLLREF_CLK_SRC = PLL_F20M
++ * (20 MHz); our boot shim inherits that because we haven't written a P4
++ * clock-controller driver yet. Target lane rate is 1000 Mbps.
++ *
++ * IDF's mipi_dsi_hal_configure_phy_pll() programs M and N such that
++ *
++ *   lane_bit_rate_mbps = f_ref_mhz * M / N
++ *
++ * — i.e. it treats VCO and lane bit rate as the same number. Despite what
++ * the canonical DW PHY datasheet says about VCO = 2 × lane_bitrate, this
++ * is what works on the ESP32-P4 silicon at hs_freq_range_sel = 0x2A; an
++ * earlier version of this driver did the textbook math and ended up
++ * programming the PLL for 2 Gbps with hs_freq_range telling the analog
++ * block we wanted 1 Gbps. LP-mode DCS still got through (LP path
++ * bypasses the PLL) but HS video bursts rendered nothing — exactly the
++ * symptom we chased for two days.
++ *
++ * For ref=20 MHz, target=1000 Mbps: M = 50, N = 1.
++ *
++ * Constraints checked by the IDF HAL search (we pre-compute because we
++ * only support one lane rate):
++ *   - M must be even (50 ✓)
++ *   - 5 MHz <= f_ref/N <= 40 MHz  (20/1 = 20 MHz ✓)
++ *
++ * Test-interface register recipe is from ESP-IDF's
++ * mipi_dsi_hal_configure_phy_pll() in components/hal/mipi_dsi_hal.c. The
++ * split write to reg 0x18 is how the PHY latches a 9-bit M-1: low 5 bits
++ * first, then high 4 bits with bit 7 set. hs_freq_range_sel lookup for
++ * the 1000-1049 Mbps bucket is 0x2A (mipi_dsi_periph.c).
++ */
++#define DSI_PLL_N				1
++#define DSI_PLL_M				50
++#define DSI_PLL_HS_FREQ_RANGE_SEL		0x2A
++
++#define DSI_PHY_REG_HS_FREQ_RANGE		0x44
++#define DSI_PHY_REG_PLL_MAGIC			0x19	/* ESP-IDF writes 0x30 */
++#define DSI_PHY_REG_PLL_N			0x17
++#define DSI_PHY_REG_PLL_M			0x18
++
++/*
++ * BONO panel (WHY2025 v2.1) — 2 data lanes at 1 Gbps. Values come from
++ * linux-native-scratch/main/main.c:
++ *   LCD_MIPI_DSI_LANE_NUM            = 2
++ *   LCD_MIPI_DSI_LANE_BITRATE_MBPS   = 1000
++ */
++#define ESP32P4_DSI_MAX_LANES			2
++#define ESP32P4_DSI_LANE_MBPS			1000
++
++struct esp32p4_dsi {
++	struct drm_device drm;		/* owns /dev/dri/cardN */
++	struct drm_simple_display_pipe pipe;
++	struct device *dev;
++
++	void __iomem *host_regs;	/* DW-MIPI-DSI host, 0x500A0000 +0x800 */
++	void __iomem *bridge_regs;	/* Espressif bridge, 0x500A0800 +0x100 */
++	void __iomem *gdma_regs;	/* DW-GDMA, 0x50081000 +0x500 */
++
++	/* Static framebuffer + LLI for one-channel loop-forever DPI feed.
++	 * Allocated lazily on first dpi_enable_work; freed in remove. */
++	void *fb_cpu;
++	dma_addr_t fb_dma;
++	size_t fb_size;
++	struct esp32p4_gdma_lli *lli_cpu;
++	dma_addr_t lli_dma;
++	bool gdma_armed;
++
++	struct regulator *phy_supply;	/* LDO3 @ 2500 mV */
++	struct reset_control *rst;	/* optional */
++
++	struct dw_mipi_dsi *dmd;
++	struct dw_mipi_dsi_plat_data pdata;
++
++	/*
++	 * DPI output is enabled from a workqueue after the DW bridge
++	 * switches the host to video mode. pipe_enable fires before the
++	 * bridge chain (pre_enable → panel DCS → enable → MODE_CFG=video),
++	 * so all Espressif bridge register writes are deferred here to avoid
++	 * disturbing the DW host state during panel DCS init.
++	 */
++	struct delayed_work dpi_enable_work;
++	bool host_attached;	/* set by esp32p4_dsi_host_attach */
++	u32 hdisp_cache, vdisp_cache;
++	u32 hsw_cache, hbp_cache, hfp_cache;
++	u32 vsw_cache, vbp_cache, vfp_cache;
++
++	/*
++	 * fbdev client setup deferred to a workqueue.
++	 * drm_fbdev_dma's shadow path needs vzalloc(720*720*2) = 1 MB of
++	 * contiguous system memory. Calling drm_client_setup_with_fourcc
++	 * synchronously from probe loses to the BMI270/BME680 sensor probes
++	 * that fragment the buddy heap during their I²C-bit-banged init.
++	 * Defer 3 s to let the heap settle and initmem free.
++	 */
++	struct delayed_work fbdev_setup_work;
++};
++
++#define drm_to_esp32p4_dsi(d) container_of(d, struct esp32p4_dsi, drm)
++
++/* ---------- clock/reset audit ------------------------------------------ */
++
++/*
++ * Power on LDO3 @ 2500 mV for the MIPI-DSI PHY analog supply.
++ *
++ * Ports esp_ldo_acquire_channel(chan=3, 2500mV) from ESP-IDF by poking
++ * PMU ext_ldo[1] directly. dref=9, mul=6 match the no-eFuse-calibration
++ * fallback of ldo_ll_voltage_to_dref_mul for 2500 mV exactly (diff=0).
++ *
++ * Diagnostic-only; when a real P4 PMU/LDO driver lands this gets replaced
++ * by regulator_enable() on a properly-backed regulator.
++ */
++static void esp32p4_dsi_ldo3_enable(struct device *dev)
++{
++	void __iomem *pmu;
++	u32 ctrl_pre, ana_pre, ctrl_post, ana_post;
++
++	pmu = ioremap(ESP32P4_PMU_BASE, ESP32P4_PMU_SIZE);
++	if (!pmu) {
++		dev_warn(dev, "LDO3: PMU ioremap failed, skipping\n");
++		return;
++	}
++
++	ctrl_pre = readl(pmu + PMU_EXT_LDO_P0_0P2A_REG);
++	ana_pre  = readl(pmu + PMU_EXT_LDO_P0_0P2A_ANA_REG);
++
++	/* analog: MUL=6, DREF=9, EN_VDET=1 (ripple suppression) */
++	ana_post = ana_pre;
++	ana_post &= ~(PMU_ANA_0P2A_MUL_MASK | PMU_ANA_0P2A_DREF_MASK);
++	ana_post |= (6u << PMU_ANA_0P2A_MUL_SHIFT) & PMU_ANA_0P2A_MUL_MASK;
++	ana_post |= (9u << PMU_ANA_0P2A_DREF_SHIFT) & PMU_ANA_0P2A_DREF_MASK;
++	ana_post |= PMU_ANA_0P2A_EN_VDET;
++	writel(ana_post, pmu + PMU_EXT_LDO_P0_0P2A_ANA_REG);
++
++	/* control: clear TIEH (use Vref*Mul, not 3.3V bypass), TIEH_SEL=0,
++	 * FORCE_TIEH_SEL=1 (SW-owned), XPD=1 (enable) */
++	ctrl_post = ctrl_pre;
++	ctrl_post &= ~(PMU_0P2A_TIEH | PMU_0P2A_TIEH_SEL_MASK);
++	ctrl_post |= PMU_0P2A_FORCE_TIEH_SEL | PMU_0P2A_XPD;
++	writel(ctrl_post, pmu + PMU_EXT_LDO_P0_0P2A_REG);
++
++	/*
++	 * Let the LDO ramp before we try to run the PHY. ESP-IDF's
++	 * esp_ldo_acquire_channel returns synchronously; the HW power-on
++	 * delay targets are left at their reset defaults (~1 ms max). 5 ms
++	 * is a conservative round-up.
++	 */
++	mdelay(5);
++
++	iounmap(pmu);
++}
++
++/*
++ * Read, log, and (optionally) force the HP_SYS_CLKRST bits that gate the
++ * DSI subsystem. ESP-IDF does this inside esp_lcd_new_dsi_bus() via
++ * PERIPH_RCC_ATOMIC { mipi_dsi_ll_enable_bus_clock + _reset_register +
++ * _enable_phy_config_clock + _enable_phy_pllref_clock }. On Linux we
++ * don't have a P4 clock driver yet, so the boot shim is the only thing
++ * that might have enabled them — and we're not sure it does. If any of
++ * these bits are 0 at probe time, every subsequent host register write
++ * silently vanishes and the first DCS transfer will spin forever on
++ * GEN_CMD_EMPTY. That's the current gate-5 hang hypothesis.
++ *
++ * Behaviour:
++ *   1. ioremap the clkrst page
++ *   2. log pre-state of the three gating registers
++ *   3. force all three clock bits on, pulse the bridge reset
++ *   4. log post-state
++ *   5. unmap (we don't need to keep the mapping after probe)
++ *
++ * No DT binding required — these are SoC-level registers, not peripheral
++ * regs. When a proper esp32p4-clk driver lands, this gets replaced with
++ * clk_prepare_enable() + reset_control_reset().
++ */
++static void esp32p4_dsi_clkrst_audit(struct device *dev)
++{
++	void __iomem *clkrst;
++	u32 ctrl1_pre, ctrl03_pre;
++
++	clkrst = ioremap(ESP32P4_HP_SYS_CLKRST_BASE, ESP32P4_HP_SYS_CLKRST_SIZE);
++	if (!clkrst) {
++		dev_warn(dev, "clkrst audit: ioremap failed, skipping\n");
++		return;
++	}
++
++	ctrl1_pre  = readl(clkrst + HP_SYS_CLKRST_SOC_CLK_CTRL1);
++	ctrl03_pre = readl(clkrst + HP_SYS_CLKRST_PERI_CLK_CTRL03);
++
++	/*
++	 * Match ESP-IDF's HP_SYS_CLKRST state for the DSI subsystem. Dump of
++	 * a working IDF boot showed:
++	 *   SOC_CLK_CTRL1   = 0x0e041060  (DSI_SYS=1, GDMA=1, DMA2D=1)
++	 *   PERI_CLK_CTRL03 = 0x000004a3  (DPHY_CFG=1, PLL_REF=1,
++	 *                                   DPICLK_SRC_SEL=1, DPICLK_EN=1,
++	 *                                   DPICLK_DIV_NUM=4)
++	 * Our previous code only enabled DSI_SYS, DPHY_CFG, PLL_REF — missing
++	 * the DPI clock and the DMA clocks the bridge needs to feed the host.
++	 * Without DPICLK_EN the DSI host has no pixel clock; VPG pattern
++	 * generation stalls and any DPI input to the host is silent, which
++	 * matches our symptom (PHY HS up, but panel sees no valid packets).
++	 */
++	writel(ctrl1_pre | DSI_SYS_CLK_EN | GDMA_SYS_CLK_EN | DMA2D_SYS_CLK_EN,
++	       clkrst + HP_SYS_CLKRST_SOC_CLK_CTRL1);
++	/* DPI clock: source PLL_F240M, divider 5 → real = 48 MHz.
++	 * Mirrors IDF for the BONO ST7703 panel:
++	 *   panel spec dpi_clock_freq_mhz = 47
++	 *   div = round(240/47) = 5
++	 *   real = 48 MHz (matches panel within 2%)
++	 * Earlier we used SEL=1+div=3 thinking that was F160M/3 = 53.33 MHz,
++	 * but SEL=1 is actually F240M (per IDF mipi_dsi_ll_set_dpi_clock
++	 * _source), so we were running at 80 MHz — 70% over panel spec.
++	 * Panel cannot latch pixels at that rate; symptom is uniform black
++	 * / grey even though host emits HS bursts and panel reports
++	 * display_on. Going to 48 MHz aligns DPI clock with panel timing
++	 * AND with the host's VID_HLINE_TIME (computed by upstream from
++	 * mode->clock=47000, so 48 MHz is within rounding). */
++	writel((ctrl03_pre & ~(0xffu << DSI_DPICLK_DIV_NUM_SHIFT)) |
++	       DSI_DPHY_CFG_CLK_EN | DSI_DPHY_PLL_REFCLK_EN |
++	       DSI_DPICLK_SRC_PLL_F240M | DSI_DPICLK_EN |
++	       (0x05u << DSI_DPICLK_DIV_NUM_SHIFT),
++	       clkrst + HP_SYS_CLKRST_PERI_CLK_CTRL03);
++
++	/*
++	 * GDMA wiring: DW-GDMA needs both clocks (sys + cpu) AND a
++	 * reset pulse. Without GDMA_CPU_CLK_EN the controller's register
++	 * interface responds to writes (CHEN0 read-back showed the right
++	 * bit set) but the channel's transfer engine never starts — the LLI
++	 * is never fetched, SAR/DAR/BLOCK_TS stay 0. SOC_CLK_CTRL0 bit 13
++	 * is the missing bit.
++	 */
++	{
++		u32 ctrl0 = readl(clkrst + HP_SYS_CLKRST_SOC_CLK_CTRL0);
++
++		writel(ctrl0 | GDMA_CPU_CLK_EN,
++		       clkrst + HP_SYS_CLKRST_SOC_CLK_CTRL0);
++	}
++
++	/*
++	 * Pulse the DSI bridge reset and the DW-GDMA module reset: bit set
++	 * to 1, then back to 0. ESP-IDF does this for both. We read-modify
++	 * -write to avoid disturbing the other 30 reset bits in HP_RST_EN0.
++	 */
++	{
++		u32 rst = readl(clkrst + HP_SYS_CLKRST_HP_RST_EN0);
++		u32 mask = RST_EN_DSI_BRG | RST_EN_GDMA;
++
++		writel(rst |  mask, clkrst + HP_SYS_CLKRST_HP_RST_EN0);
++		writel(rst & ~mask, clkrst + HP_SYS_CLKRST_HP_RST_EN0);
++	}
++
++	/* Boot shim does not pre-enable the DSI gates; the writes above
++	 * unconditionally force them on. No need to warn — the audit IS the
++	 * fix until a real ESP32-P4 clk driver lands. */
++	(void)ctrl1_pre;
++	(void)ctrl03_pre;
++
++	iounmap(clkrst);
++}
++
++/* ---------- PHY ops ----------------------------------------------------- */
++
++/*
++ * DW MIPI D-PHY test interface: bit-banged two-phase protocol.
++ *
++ *   address phase: TESTEN=1, data[7:0] = regaddr, pulse TESTCLK
++ *   data phase:    TESTEN=0, data[7:0] = regval,  pulse TESTCLK
++ *
++ * The "pulse TESTCLK" sequence the Synopsys reference driver uses (and
++ * ESP-IDF matches via write_clock(0) / write_clock(1) / write_clock(0))
++ * is clock-low → clock-high → clock-low between each write. We inline
++ * that rather than factoring helpers; the phase boundary matters and a
++ * helper hides it.
++ */
++static void esp32p4_dsi_phy_write_reg(struct esp32p4_dsi *dsi, u8 reg, u8 val)
++{
++	void __iomem *h = dsi->host_regs;
++
++	/* address phase */
++	writel(0, h + DW_MIPI_DSI_PHY_TST_CTRL0);
++	writel(PHY_TST_CTRL1_TESTEN | reg, h + DW_MIPI_DSI_PHY_TST_CTRL1);
++	writel(PHY_TST_CTRL0_TESTCLK, h + DW_MIPI_DSI_PHY_TST_CTRL0);
++	writel(0, h + DW_MIPI_DSI_PHY_TST_CTRL0);
++
++	/* data phase */
++	writel(val, h + DW_MIPI_DSI_PHY_TST_CTRL1);
++	writel(PHY_TST_CTRL0_TESTCLK, h + DW_MIPI_DSI_PHY_TST_CTRL0);
++	writel(0, h + DW_MIPI_DSI_PHY_TST_CTRL0);
++}
++
++static int esp32p4_dsi_phy_init(void *priv_data)
++{
++	struct esp32p4_dsi *dsi = priv_data;
++
++	/*
++	 * The DW bridge driver enters here with PHY_RSTZ/SHUTDOWNZ/ENABLECLK
++	 * deasserted and the test interface held in reset (TESTCLR=1). It
++	 * clears TESTCLR right before calling us, so we can push bytes
++	 * immediately.
++	 *
++	 * Sequence is the same as ESP-IDF mipi_dsi_hal_configure_phy_pll():
++	 *   0x44: hs_freq_range << 1    (1000-1049 Mbps bucket = 0x2A)
++	 *   0x19: 0x30                  (PLL analog magic per vendor)
++	 *   0x17: N - 1
++	 *   0x18: (M - 1) & 0x1F        (low five bits)
++	 *   0x18: 0x80 | (((M-1) >> 5) & 0x0F)  (high bits, latch on bit 7)
++	 */
++	esp32p4_dsi_phy_write_reg(dsi, DSI_PHY_REG_HS_FREQ_RANGE,
++				  DSI_PLL_HS_FREQ_RANGE_SEL << 1);
++	esp32p4_dsi_phy_write_reg(dsi, DSI_PHY_REG_PLL_MAGIC, 0x30);
++	esp32p4_dsi_phy_write_reg(dsi, DSI_PHY_REG_PLL_N, DSI_PLL_N - 1);
++	esp32p4_dsi_phy_write_reg(dsi, DSI_PHY_REG_PLL_M,
++				  (DSI_PLL_M - 1) & 0x1F);
++	esp32p4_dsi_phy_write_reg(dsi, DSI_PHY_REG_PLL_M,
++				  0x80 | (((DSI_PLL_M - 1) >> 5) & 0x0F));
++	return 0;
++}
++
++static void esp32p4_dsi_phy_power_on(void *priv_data)
++{
++	struct esp32p4_dsi *dsi = priv_data;
++	void __iomem *h = dsi->host_regs;
++	u32 status;
++	int i;
++
++	/*
++	 * The DW bridge sets PHY_ENABLECLK|FORCEPLL|SHUTDOWNZ|RSTZ and then
++	 * busy-waits for PHY_LOCK itself, so we're just here to record what
++	 * actually happened — if the lock never asserts we want that in the
++	 * log before the bridge's own (silent) timeout expires.
++	 */
++	for (i = 0; i < 1000; i++) {
++		status = readl(h + DW_MIPI_DSI_PHY_STATUS);
++		if (status & PHY_STATUS_PHY_LOCK)
++			break;
++		udelay(10);
++	}
++
++	if (!(status & PHY_STATUS_PHY_LOCK))
++		dev_warn(dsi->dev,
++			 "phy_power_on: PLL did not lock after 10ms (PHY_STATUS=%#x)\n",
++			 status);
++	else
++		dev_dbg(dsi->dev,
++			"phy_power_on: PHY_STATUS=%#x lock=1 stop_clk=%d after %d×10us\n",
++			status,
++			!!(status & PHY_STATUS_STOP_STATE_CLK_LANE),
++			i);
++
++	/*
++	 * Clear TXREQUESTCLKHS to put the clock lane into LP-Stop (LP-11).
++	 *
++	 * Panel DCS init runs in LP escape mode: the panel descriptor sets
++	 * MIPI_DSI_MODE_LPM, which causes mipi_dsi_device_transfer() to add
++	 * MIPI_DSI_MSG_USE_LPM to every message, which causes
++	 * dw_mipi_message_config() to write CMD_MODE_ALL_LP to CMD_MODE_CFG
++	 * before each transfer. LP escape requires the clock lane in LP-11;
++	 * driving a continuous HS byte clock while attempting LP escape causes
++	 * the panel to miss the LP-01 escape-entry sequence and discard the
++	 * command, which is why every DCS write returned -ETIMEDOUT.
++	 *
++	 * IDF confirms this: esp_lcd_mipi_dsi_bus.c sets clock lane to
++	 * CLOCK_LANE_STATE_LP before DCS, and esp_lcd_panel_io_dbi.c marks
++	 * all 12 DCS packet types as MIPI_DSI_LL_TRANS_SPEED_LP.
++	 *
++	 * dw_mipi_dsi_set_mode(CMD) (called before us) writes
++	 * LPCLK_CTRL=TXREQUESTCLKHS=1; clear it here. Poll until the PHY
++	 * confirms LP-11 so the first DCS write doesn't race the state machine.
++	 *
++	 * Note: DSI_BRG_EN is NOT set here. The bridge is only in the DPI
++	 * video path; esp32p4_dsi_dpi_enable_work() sets it at the right time
++	 * (after the 400ms panel DCS init window). IDF likewise does not set
++	 * DSI_BRG_EN during DCS command mode.
++	 */
++	writel(0, h + DW_MIPI_DSI_LPCLK_CTRL);
++
++	for (i = 0; i < 500; i++) {
++		status = readl(h + DW_MIPI_DSI_PHY_STATUS);
++		if (status & PHY_STATUS_STOP_STATE_CLK_LANE)
++			break;
++		udelay(10);
++	}
++
++	if (!(status & PHY_STATUS_STOP_STATE_CLK_LANE))
++		dev_warn(dsi->dev,
++			 "clock lane failed to enter LP-Stop after 5ms: PHY_STATUS=%#x\n",
++			 status);
++
++	/*
++	 * v5 reorder: the Espressif bridge is NOT enabled here.
++	 *
++	 * Previously we enabled the bridge in phy_power_on to provide DPI
++	 * blanking windows for LP DCS during VIDEO mode. Instrumentation
++	 * proved that theory wrong: with the bridge enabled and MODE_CFG=VIDEO,
++	 * LP DCS got stuck in GEN_BUFF (CMD_PKT_STATUS bits 17/19) and never
++	 * transmitted on the wire — panel never received its init sequence.
++	 *
++	 * ESP-IDF's proven flow: keep MODE_CFG=CMD and bridge OFF during panel
++	 * DCS init; enable bridge + flip to VIDEO only after DCS completes.
++	 * We match that by (a) setting plat_data->defer_video_mode_switch so
++	 * the DW core skips set_mode(VIDEO) in atomic_enable, and (b) moving
++	 * bridge enable into esp32p4_dsi_dpi_enable_work, scheduled far enough
++	 * after pipe_enable (2 s) that panel .enable has finished.
++	 */
++}
++
++static void esp32p4_dsi_phy_power_off(void *priv_data)
++{
++	struct esp32p4_dsi *dsi = priv_data;
++
++	dev_dbg(dsi->dev, "phy_power_off (stub)\n");
++}
++
++static int esp32p4_dsi_phy_get_lane_mbps(void *priv_data,
++					 const struct drm_display_mode *mode,
++					 unsigned long mode_flags, u32 lanes,
++					 u32 format, unsigned int *lane_mbps)
++{
++	struct esp32p4_dsi *dsi = priv_data;
++
++	/*
++	 * BONO panel wants 1 Gbps per lane. We ignore mode/format here —
++	 * the PHY PLL is configured by the boot shim and not retargeted at
++	 * runtime. A future gate will compute this from mode + format.
++	 */
++	*lane_mbps = ESP32P4_DSI_LANE_MBPS;
++	dev_dbg(dsi->dev, "get_lane_mbps: lanes=%u fmt=%u -> %u Mbps (fixed)\n",
++		lanes, format, *lane_mbps);
++	return 0;
++}
++
++/*
++ * D-PHY HS/LP switch timings in units of lane byte clock cycles. The DW
++ * driver treats these as device-specific but is tolerant of conservative
++ * values; these match what ST's STM32 glue uses for mid-range lane rates
++ * and are within the DW IP's programmable range. Real values need to
++ * come out of the ESP32-P4 PHY datasheet (@TODO).
++ */
++static int esp32p4_dsi_phy_get_timing(void *priv_data, unsigned int lane_mbps,
++				      struct dw_mipi_dsi_dphy_timing *timing)
++{
++	/*
++	 * D-PHY HS/LP switch timings in lanebyteclk cycles.
++	 *
++	 * Values copied from IDF's esp_lcd_mipi_dsi_bus.c:
++	 *   mipi_dsi_phy_ll_set_switch_time(hal->host, 50, 104, 46, 128);
++	 *                                             data_hs2lp=50
++	 *                                             data_lp2hs=104
++	 *                                             clk_hs2lp=46
++	 *                                             clk_lp2hs=128
++	 *
++	 * Previous values (all 0x40 = 64) were STM32 glue placeholders. On
++	 * the ESP32-P4 D-PHY with our PLL config (2000 MHz VCO, 1 Gbps lane,
++	 * 125 MHz byteclk) the placeholders yielded data_lp2hs too short (64
++	 * vs 104) and clk_lp2hs half what's needed (64 vs 128). Symptom: DW
++	 * host reports HS on data lanes, but the panel never sees a valid
++	 * LP->HS sync — every packet decoded as garbage, panel stays in
++	 * default power-on state with no visible output even under external
++	 * transmissive lighting.
++	 */
++	timing->data_hs2lp = 50;
++	timing->data_lp2hs = 104;
++	timing->clk_hs2lp  = 46;
++	timing->clk_lp2hs  = 128;
++	return 0;
++}
++
++static const struct dw_mipi_dsi_phy_ops esp32p4_dsi_phy_ops = {
++	.init		= esp32p4_dsi_phy_init,
++	.power_on	= esp32p4_dsi_phy_power_on,
++	.power_off	= esp32p4_dsi_phy_power_off,
++	.get_lane_mbps	= esp32p4_dsi_phy_get_lane_mbps,
++	.get_timing	= esp32p4_dsi_phy_get_timing,
++};
++
++/* ---------- host ops ---------------------------------------------------- */
++
++static int esp32p4_dsi_host_attach(void *priv_data, struct mipi_dsi_device *device)
++{
++	struct esp32p4_dsi *dsi = priv_data;
++
++	dsi->host_attached = true;
++	return 0;
++}
++
++static int esp32p4_dsi_host_detach(void *priv_data, struct mipi_dsi_device *device)
++{
++	return 0;
++}
++
++static const struct dw_mipi_dsi_host_ops esp32p4_dsi_host_ops = {
++	.attach = esp32p4_dsi_host_attach,
++	.detach = esp32p4_dsi_host_detach,
++};
++
++/* ---------- display pipe -------------------------------------------------- */
++
++static const uint32_t esp32p4_dsi_formats[] = {
++	DRM_FORMAT_RGB565,
++};
++
++/*
++ * DRM bridge enable sequence for this driver:
++ *
++ *   pipe_enable  (CRTC loop, fires first)
++ *     └─ caches DPI timing from drm_display_mode; schedules dpi_enable_work
++ *        400 ms out.  No bridge registers are written here because pipe_enable
++ *        runs before the bridge chain — asserting DSI_BRG_EN at this point
++ *        would drive DPI sync onto the DW host's DPI input while it is still
++ *        in command mode for panel DCS init, which can upset LP escape timing.
++ *
++ *   bridge_atomic_pre_enable  (fires next, reverse order)
++ *     ├─ panel_bridge pre_enable → drm_panel_prepare(): GPIO reset + full
++ *     │  DCS init sequence (st7703: sleep-out + init table, ~150 ms total)
++ *     └─ DW bridge pre_enable   → phy_init (PLL bytes via test i/f),
++ *        set_mode(CMD), phy_power_on (clock lane → LP-Stop)
++ *
++ *   bridge_atomic_enable  (fires next, forward order)
++ *     ├─ DW bridge enable  → set_mode(VIDEO): TXREQUESTCLKHS=1, clock lane
++ *     │  enters HS.  DW host now waits for DPI VSYNC to start a frame.
++ *     └─ panel_bridge enable → drm_panel_enable(): DCS display-on
++ *
++ *   dpi_enable_work  (400 ms after pipe_enable, well after panel DCS done)
++ *     ├─ program all Espressif bridge registers (timing, pixel type, DMA cfg)
++ *     ├─ DSI_BRG_EN=1: bridge starts driving DPI sync → DW host starts HS
++ *     │  video packets.  C6 detects HS traffic → backlight turns on.
++ *     ├─ MODE_CFG=0 (video): belt-and-braces restore in case DCS reads
++ *     │  parked the host in CMD mode.
++ *     └─ DPI_EN=1: pixel data output begins (fill colour until DMA wired).
++ */
++/*
++ * Deferred late-enable work — v5.
++ *
++ * Fires ~2 s after pipe_enable, well after the bridge chain's
++ * panel_bridge.enable callback has finished issuing all panel DCS init
++ * (ST7703 .enable does init sequence + ~120 ms sleep_out + DISPLAY_ON).
++ *
++ * At this point MODE_CFG is still 1 (CMD) because the DW core honored
++ * plat_data->defer_video_mode_switch and skipped set_mode(VIDEO) in
++ * atomic_enable. Bridge is still OFF (we removed the bridge-enable block
++ * from phy_power_on).
++ *
++ * The work now does what IDF does in dpi_panel_init(): program bridge
++ * timing, enable DSI_BRG_EN, enable DPI output, then call
++ * dw_mipi_dsi_late_enable_video() to hand the host over to VIDEO mode.
++ *
++ * TODO after bring-up: replace the fixed 2 s delay with a proper hook
++ * triggered by the bridge chain enable completion, or move the late-
++ * enable into a custom bridge wrapper.
++ */
++/* ---------- DW-GDMA wiring (GDMA wiring) -------------------------- */
++
++/*
++ * Fill a 720x720 RGB565 framebuffer with vertical colour bars.
++ * Order from left to right: red, green, blue, white.
++ *
++ * RGB565 packing: bits[15:11]=R5, bits[10:5]=G6, bits[4:0]=B5.
++ * Stored little-endian in memory.
++ */
++static void esp32p4_dsi_fill_test_pattern(u16 *fb, u32 hdisp, u32 vdisp)
++{
++	/*
++	 * DIAGNOSTIC: solid white. If the panel goes from black to white,
++	 * the entire pipeline (PSRAM→GDMA→bridge→host→PHY→panel) is
++	 * delivering pixels and the issue is something about our colour bar
++	 * fill pattern. If the panel stays black with all-white fill, pixels
++	 * aren't landing at all — DMA is delivering zeros (cache flush
++	 * issue) or panel is rejecting every packet.
++	 *
++	 * RGB565 0xFFFF = R31 G63 B31 = white.
++	 */
++	u32 i, total = hdisp * vdisp;
++
++	for (i = 0; i < total; i++)
++		fb[i] = 0xFFFF;
++}
++
++/*
++ * One-shot DW-GDMA setup:
++ *   - Allocate a static framebuffer in coherent memory
++ *   - Fill with test pattern
++ *   - Allocate one LLI, point its 'next' field at itself (loop forever)
++ *   - Configure GDMA channel 0: mem→DSI bridge, DMA-as-flow-controller,
++ *     hardware handshake, DSI periph (id=0)
++ *   - Enable the channel via CHEN0
++ *
++ * Idempotent: safe to call multiple times; only does work on first call.
++ *
++ * After this returns, GDMA is continuously pumping pixels into the bridge
++ * FIFO at 0x50105000. The bridge then generates DPI sync + pixclk for the
++ * DW host, which packetises and emits HS video on the data lanes.
++ */
++static int esp32p4_dsi_gdma_arm(struct esp32p4_dsi *dsi)
++{
++	struct device *dev = dsi->dev;
++	void __iomem *g = dsi->gdma_regs;
++	const u32 hdisp = dsi->hdisp_cache;
++	const u32 vdisp = dsi->vdisp_cache;
++	const size_t fb_size = (size_t)hdisp * vdisp * 2; /* RGB565 = 2 B/px */
++	const u32 chan = 0;
++	const u32 ch = GDMA_CH_OFFSET(chan);
++	struct esp32p4_gdma_lli *lli;
++	u32 cfg0_val, cfg1_val, ctl0_val, ctl1_val;
++
++	if (dsi->gdma_armed)
++		return 0;
++
++	/*
++	 * Bring the DW-GDMA controller out of any stale state from prior
++	 * boots. dw_gdma_ll_reset(): write 1 to dmac_rst, wait for hw to
++	 * clear it. Then enable the top-level DMAC + interrupt master. This
++	 * MUST happen before any per-channel writes — channel registers
++	 * don't take effect with dmac_en=0.
++	 */
++	writel(BIT(0), g + GDMA_RESET0);	/* dmac_rst = 1 */
++	{
++		int wait = 1000;
++
++		while ((readl(g + GDMA_RESET0) & BIT(0)) && --wait)
++			udelay(1);
++		if (!wait)
++			dev_warn(dev, "GDMA reset did not self-clear\n");
++	}
++	writel(BIT(0) | BIT(1), g + GDMA_CFG0);	/* dmac_en | int_en */
++
++	/* Framebuffer — coherent allocation. On NOMMU RV32 this returns a
++	 * directly-mapped buffer; phys == virt and we can stamp pixels into
++	 * it then hand the same address to the DMA engine. */
++	dsi->fb_cpu = dma_alloc_coherent(dev, fb_size, &dsi->fb_dma, GFP_KERNEL);
++	if (!dsi->fb_cpu)
++		return dev_err_probe(dev, -ENOMEM, "fb alloc (%zu bytes) failed\n", fb_size);
++	dsi->fb_size = fb_size;
++
++	esp32p4_dsi_fill_test_pattern(dsi->fb_cpu, hdisp, vdisp);
++	/* Push pixels from D-cache out to PSRAM so DMA sees them. */
++	esp32p4_dsi_psram_flush(dsi->fb_cpu, fb_size);
++
++	/* LLI — 64 bytes, 64-byte aligned. dma_alloc_coherent bumps to PAGE
++	 * boundary (≥64 B), so the alignment requirement is met for free. */
++	dsi->lli_cpu = dma_alloc_coherent(dev, sizeof(*dsi->lli_cpu),
++					  &dsi->lli_dma, GFP_KERNEL);
++	if (!dsi->lli_cpu) {
++		dma_free_coherent(dev, fb_size, dsi->fb_cpu, dsi->fb_dma);
++		dsi->fb_cpu = NULL;
++		return dev_err_probe(dev, -ENOMEM, "lli alloc failed\n");
++	}
++	lli = dsi->lli_cpu;
++	memset(lli, 0, sizeof(*lli));
++
++	/* Build the LLI. Block transfer size is in 64-bit words: total bits
++	 * = fb_size * 8, divided by 64. Hardware wants N-1 in the field. */
++	lli->sar0 = (u32)dsi->fb_dma;
++	lli->dar0 = ESP32P4_DSI_BRG_MEM_BASE;
++	lli->block_ts0 = ((fb_size * 8 / 64) - 1) & 0x3FFFFFu;
++	/* llp0: lms (master port for the LLP fetch itself) in bit 0.
++	 *   lms = 1 = MEMORY  (correct for fetching LLI from PSRAM)
++	 *   lms = 0 = MIPI_DSI (wrong — would fetch from bridge FIFO)
++	 * IDF constants: DW_GDMA_LL_MASTER_PORT_MIPI_DSI=0, _MEMORY=1.
++	 * loc0 in bits[31:6] = next LLI addr >> 6. Self-loop: point at us. */
++	lli->llp0 = (((u32)dsi->lli_dma) & ~0x3Fu) | BIT(0);	/* lms=1 (MEMORY) */
++	lli->llp1 = 0;
++	/* CTL0: src=mem (sms=1, sinc=INCR), dst=DSI bridge (dms=0, dinc=FIXED),
++	 * 64-bit transfer width, msize 512 (src) / 256 (dst) — matches IDF. */
++	ctl0_val = GDMA_CTL0_SMS_MEMORY | GDMA_CTL0_DMS_DSI |
++		   GDMA_CTL0_SINC_INCR | GDMA_CTL0_DINC_FIXED |
++		   GDMA_CTL0_SRC_TR_WIDTH(GDMA_CTL0_TR_WIDTH_64) |
++		   GDMA_CTL0_DST_TR_WIDTH(GDMA_CTL0_TR_WIDTH_64) |
++		   GDMA_CTL0_SRC_MSIZE(GDMA_CTL0_MSIZE_512) |
++		   GDMA_CTL0_DST_MSIZE(GDMA_CTL0_MSIZE_256);
++	lli->ctl0 = ctl0_val;
++	/* CTL1: AXI burst length 16 on both sides; LLI is valid + NOT last
++	 * (NOT last → engine fetches next, which is self → loops forever). */
++	ctl1_val = GDMA_CTL1_ARLEN_EN | GDMA_CTL1_ARLEN(16) |
++		   GDMA_CTL1_AWLEN_EN | GDMA_CTL1_AWLEN(16) |
++		   GDMA_CTL1_LLI_VALID;	/* lli_last left at 0 */
++	lli->ctl1 = ctl1_val;
++
++	/* Configure channel registers (cfg0 / cfg1 / llp / block_ts).
++	 *
++	 * In LIST multi-block mode, sar/dar/block_ts are pulled from the LLI
++	 * by hardware on transfer start; we still set the channel's llp to
++	 * point at the LLI head. cfg0 selects multi-block type, cfg1 selects
++	 * transfer flow + handshake.
++	 */
++	cfg0_val = GDMA_CFG0_SRC_MULTIBLK_LIST | GDMA_CFG0_DST_MULTIBLK_LIST;
++	writel(cfg0_val, g + ch + GDMA_CH_CFG0);
++
++	cfg1_val = GDMA_CFG1_TT_FC_M2P_DMAC |	/* mem→periph, DMAC is FC */
++		   GDMA_CFG1_HS_SEL_SRC_HW |
++		   GDMA_CFG1_HS_SEL_DST_HW |
++		   GDMA_CFG1_DST_PER_DSI |	/* DSI handshake periph (id=0) */
++		   GDMA_CFG1_CH_PRIOR(1) |
++		   GDMA_CFG1_SRC_OSR_LMT(5) |	/* 5 outstanding reads from PSRAM */
++		   GDMA_CFG1_DST_OSR_LMT(2);	/* 2 outstanding writes to bridge */
++	writel(cfg1_val, g + ch + GDMA_CH_CFG1);
++
++	/* Channel's LLP register: lms (bit 0) = 1 = MEMORY (so engine fetches
++	 * the first LLI from PSRAM, not from the DSI bridge port). loc0 in
++	 * bits[31:6] = LLI addr >> 6 (low 6 bits ignored). */
++	writel((((u32)dsi->lli_dma) & ~0x3Fu) | BIT(0), g + ch + GDMA_CH_LLP0);
++	writel(0, g + ch + GDMA_CH_LLP1);
++
++	/* Disable channel-level interrupts for now — we don't have an IRQ
++	 * handler, and the channel runs autonomously. */
++	writel(0, g + ch + GDMA_CH_INTSIGENA0);
++	writel(0, g + ch + GDMA_CH_INTSIGENA1);
++
++	/* Flush LLI fields out of D-cache so the GDMA engine reads what we
++	 * just wrote (PSRAM, not stale zeros). MUST happen before channel
++	 * enable, else engine fetches lli_valid=0 and fires
++	 * SHADOWREG_OR_LLI_INVALID_ERR (INT_ST0 bit 13). */
++	esp32p4_dsi_psram_flush(lli, sizeof(*lli));
++
++	/* Finally, enable channel via CHEN0 write-enable mask. */
++	writel(GDMA_CHEN_ENABLE(chan), g + GDMA_CHEN0);
++
++	dev_info(dev,
++		 "GDMA armed: fb @%pad (%zu B) → %#x via LLI @%pad chan=%u; "
++		 "block_ts=%u (64b words)\n",
++		 &dsi->fb_dma, fb_size, ESP32P4_DSI_BRG_MEM_BASE,
++		 &dsi->lli_dma, chan, lli->block_ts0 + 1);
++
++	/*
++	 * Wait for the GDMA engine to fetch the LLI and start filling the
++	 * bridge FIFO. Without this delay the host transitions into VIDEO
++	 * mode (in late_enable_video, called by our caller) with an empty
++	 * bridge FIFO and locks the system bus — boot freezes.
++	 */
++	udelay(1000);
++
++	dsi->gdma_armed = true;
++	return 0;
++}
++
++static void esp32p4_dsi_gdma_release(struct esp32p4_dsi *dsi)
++{
++	if (!dsi->gdma_armed)
++		return;
++	/* Disable channel: write 0 to ch_en bit, 1 to ch_en_we mask. */
++	writel((1u << (8 + 0)), dsi->gdma_regs + GDMA_CHEN0);
++	if (dsi->lli_cpu) {
++		dma_free_coherent(dsi->dev, sizeof(*dsi->lli_cpu),
++				  dsi->lli_cpu, dsi->lli_dma);
++		dsi->lli_cpu = NULL;
++	}
++	if (dsi->fb_cpu) {
++		dma_free_coherent(dsi->dev, dsi->fb_size,
++				  dsi->fb_cpu, dsi->fb_dma);
++		dsi->fb_cpu = NULL;
++	}
++	dsi->gdma_armed = false;
++}
++
++/* Forward decl: defined alongside pipe_update below. */
++static bool esp32p4_dsi_blit_fb(struct esp32p4_dsi *dsi,
++				struct drm_framebuffer *fb,
++				u32 src_y);
++
++static void esp32p4_dsi_fbdev_setup_work(struct work_struct *work)
++{
++	struct esp32p4_dsi *dsi =
++		container_of(to_delayed_work(work), struct esp32p4_dsi,
++			     fbdev_setup_work);
++
++	drm_client_setup_with_fourcc(&dsi->drm, DRM_FORMAT_RGB565);
++}
++
++static void esp32p4_dsi_dpi_enable_work(struct work_struct *work)
++{
++	struct esp32p4_dsi *dsi =
++		container_of(to_delayed_work(work), struct esp32p4_dsi,
++			     dpi_enable_work);
++	void __iomem *h = dsi->host_regs;
++	void __iomem *b = dsi->bridge_regs;
++	u32 hdisp  = dsi->hdisp_cache;
++	u32 vdisp  = dsi->vdisp_cache;
++	u32 hsw    = dsi->hsw_cache;
++	u32 hbp    = dsi->hbp_cache;
++	u32 hfp    = dsi->hfp_cache;
++	u32 vsw    = dsi->vsw_cache;
++	u32 vbp    = dsi->vbp_cache;
++	/*
++	 * IDF HAL compensates bridge HFP for DPI clock rounding:
++	 *   compensation = round(real_dpi/expected_dpi * htotal) - htotal
++	 *   bridge_hfp_compensated = hfp + compensation
++	 * With our (now-corrected) PLL_F240M / 5 = 48 MHz real, panel spec
++	 * 47 MHz, htotal=1006:
++	 *   round(48/47 * 1006) - 1006 = 1027 - 1006 = +21
++	 * This matches the IDF golden bridge htotal of 1027 captured by
++	 * linux-native-scratch. Earlier code used +136 — that was the
++	 * compensation for the buggy PLL_F240M/3 = 80 MHz path; once the
++	 * clock is corrected, only +21 is needed.
++	 */
++	u32 hfp_compensated = hfp + 21;
++	u32 htotal = hdisp + hsw + hbp + hfp_compensated;
++	u32 vtotal = vdisp + vsw + vbp + dsi->vfp_cache;
++	u32 raw_num = hdisp * vdisp / 4;
++
++	/*
++	 * Program the Espressif DPI bridge — previously in phy_power_on().
++	 * Timing registers, pixel type, DMA flow control, FIFO thresholds,
++	 * then DSI_BRG_EN=1 and DPI_MISC_CFG.dpi_en=1. This is equivalent to
++	 * IDF's dpi_panel_init() register sequence.
++	 */
++	writel((vdisp << 16) | vtotal,  b + DSI_BRG_DPI_V_CFG0);
++	writel((vsw   << 16) | vbp,     b + DSI_BRG_DPI_V_CFG1);
++	writel((hdisp << 16) | htotal,  b + DSI_BRG_DPI_H_CFG0);
++	writel((hsw   << 16) | hbp,     b + DSI_BRG_DPI_H_CFG1);
++	writel(DSI_BRG_RAW_TYPE_RGB565, b + DSI_BRG_PIXEL_TYPE);
++	/*
++	 * DMA_FLOW_CTRL bits:
++	 *   [0]    dsi_dma_flow_controller  — 0: DMAC; 1: dsi_bridge
++	 *   [7:4]  dma_flow_multiblk_num    — IDF sets 1
++	 *
++	 * GDMA wiring: DW-GDMA is now wired up (esp32p4_dsi_gdma_arm
++	 * below). DMAC = flow controller, multi_block_num=1 to match IDF.
++	 */
++	writel((0u << 0) | (1u << 4),   b + DSI_BRG_DMA_FLOW_CTRL);
++	writel(raw_num | BIT(31),       b + DSI_BRG_RAW_NUM_CFG);
++	writel(256u,                    b + DSI_BRG_DMA_REQ_CFG);
++	writel(1024u - 256u,            b + DSI_BRG_ALMOST_EMPTY_THRD);
++	/* IDF order: bridge enable + DPI config first WITHOUT dpi_en, then
++	 * GDMA arm, then host into VIDEO mode, then flip dpi_en at the end.
++	 * This avoids the bridge driving DPI sync into a host that's not yet
++	 * in video mode. */
++	writel((hdisp << 4) & 0xFFFF0,  b + DSI_BRG_DPI_MISC_CFG); /* dpi_en=0 */
++	writel(BIT(0),                  b + DSI_BRG_EN);
++	writel(BIT(0),                  b + DSI_BRG_DPI_CFG_UPDATE);
++
++	/* Arm DW-GDMA: allocates fb, fills colour bars, points channel 0
++	 * at a self-looping LLI feeding the bridge FIFO. After this, the
++	 * bridge has a continuous DPI pixel source and the DW host can
++	 * generate real HS video packets. */
++	if (esp32p4_dsi_gdma_arm(dsi))
++		dev_err(dsi->dev, "GDMA arm failed; bridge will starve\n");
++
++	/*
++	 * Mirror IDF golden PHY_IF_CFG: phy_stop_wait_time = 0x3f, not the
++	 * 0x20 reset default the upstream DW core leaves in place. Without
++	 * this the panel may not detect the LP→HS edge cleanly on every
++	 * frame and silently drop the entire video burst.
++	 */
++	writel((0x3fu << 8) | (ESP32P4_DSI_MAX_LANES - 1), h + 0xa4);
++
++	/*
++	 * CLKMGR_CFG (0x08): IDF golden = 0x0d07 (tx_esc_clk_div=7,
++	 * to_clk_div=13). Upstream sets tx_esc_clk_div but leaves
++	 * to_clk_div at reset (0), which gates timeout-driven state
++	 * machines (BTA, LP escape, video-mode FSM transitions) at "never".
++	 */
++	writel((readl(h + 0x08) & ~0xff00u) | (13u << 8), h + 0x08);
++
++	/*
++	 * Hand the DW host over to VIDEO mode. set_mode(VIDEO) inside the
++	 * DW core: PWR_UP=RESET, MODE_CFG=0, video_mode_config,
++	 * LPCLK_CTRL=TXREQUESTCLKHS (clock lane to HS), PWR_UP=POWERUP.
++	 * After this, the host starts consuming DPI sync from the bridge
++	 * and pushes HS video packets onto the data lanes.
++	 */
++	dw_mipi_dsi_late_enable_video(dsi->dmd);
++
++	/* Final step: NOW flip dpi_en on the bridge so it starts driving the
++	 * DPI sync into the host's now-VIDEO-mode input. Mirror IDF order. */
++	writel(((hdisp << 4) & 0xFFFF0) | BIT(0), b + DSI_BRG_DPI_MISC_CFG);
++	writel(BIT(0),                            b + DSI_BRG_DPI_CFG_UPDATE);
++
++	/*
++	 * Let video stream settle for ~5 frames at 60 Hz before flipping
++	 * VID_MODE_CFG below. Toggling LP_CMD_EN mid-burst confuses the
++	 * host's VBI scheduler.
++	 */
++	msleep(90);
++
++	/*
++	 * VID_MODE_CFG.LP_CMD_EN (BIT 15) lets DCS commands flow in LP
++	 * escape during VBI while video is active. FRAME_BTA_ACK_EN
++	 * (BIT 14) lets the host take the bus back cleanly after panel
++	 * BTA. IDF golden VID_MODE_CFG = 0xff02.
++	 */
++	writel(readl(h + 0x38) | BIT(15) | BIT(14), h + 0x38);
++
++	/*
++	 * Catch-up blit. Atomic commits that fired before fb_cpu was
++	 * allocated (gdma_arm above) had nowhere to land — pipe_update's
++	 * skip path returned without copying. Now that fb_cpu exists,
++	 * copy whatever's currently committed in plane.state->fb so
++	 * fbcon's boot output replaces the test pattern. Without this,
++	 * the panel shows the test pattern (white) forever, since fbcon
++	 * doesn't trigger another commit after boot finishes.
++	 */
++	{
++		struct drm_plane_state *st = dsi->pipe.plane.state;
++
++		esp32p4_dsi_blit_fb(dsi, st ? st->fb : NULL,
++				    st ? (st->src_y >> 16) : 0);
++	}
++}
++
++static void esp32p4_dsi_pipe_enable(struct drm_simple_display_pipe *pipe,
++				     struct drm_crtc_state *crtc_state,
++				     struct drm_plane_state *plane_state)
++{
++	struct esp32p4_dsi *dsi = container_of(pipe, struct esp32p4_dsi, pipe);
++	const struct drm_display_mode *mode = &crtc_state->mode;
++
++	/*
++	 * pipe_enable fires in the CRTC loop of drm_atomic_helper_commit_
++	 * modeset_enables(), BEFORE the connector/encoder loop that calls
++	 * drm_atomic_bridge_chain_pre_enable (PHY init + CMD mode) and
++	 * drm_atomic_bridge_chain_enable (video mode).  Writing bridge regs
++	 * here — especially DSI_BRG_EN — causes the bridge to drive DPI
++	 * sync signals onto the DW host's DPI input before it has configured
++	 * CMD mode for panel DCS, blocking LP DCS commands.  Cache the timing
++	 * and do all register programming from the deferred work instead.
++	 */
++	dsi->hdisp_cache = mode->hdisplay;
++	dsi->vdisp_cache = mode->vdisplay;
++	dsi->hsw_cache   = mode->hsync_end   - mode->hsync_start;
++	dsi->hbp_cache   = mode->htotal      - mode->hsync_end;
++	dsi->hfp_cache   = mode->hsync_start - mode->hdisplay;
++	dsi->vsw_cache   = mode->vsync_end   - mode->vsync_start;
++	dsi->vbp_cache   = mode->vtotal      - mode->vsync_end;
++	dsi->vfp_cache   = mode->vsync_start - mode->vdisplay;
++
++	/*
++	 * v5: 3 s delay instead of 400 ms. The late-enable work now programs
++	 * the bridge and performs the VIDEO-mode transition — it must fire
++	 * AFTER panel_bridge.enable completes, which runs after dw_bridge.
++	 * atomic_enable (~1.25 s) plus ST7703 .enable's init table (~50 ms)
++	 * + sleep_out wait (120 ms) + DISPLAY_ON — so completion ~1.4 s.
++	 * 3 s gives ~1.5 s margin. TODO: replace with a proper bridge-chain-
++	 * done hook once bring-up settles.
++	 */
++	schedule_delayed_work(&dsi->dpi_enable_work, msecs_to_jiffies(3000));
++}
++
++static void esp32p4_dsi_pipe_disable(struct drm_simple_display_pipe *pipe)
++{
++	struct esp32p4_dsi *dsi = container_of(pipe, struct esp32p4_dsi, pipe);
++	void __iomem *b = dsi->bridge_regs;
++
++	cancel_delayed_work_sync(&dsi->dpi_enable_work);
++	cancel_delayed_work_sync(&dsi->fbdev_setup_work);
++
++	/* Stop DMA before disabling bridge so the GDMA engine doesn't keep
++	 * pushing into a dead FIFO. */
++	esp32p4_dsi_gdma_release(dsi);
++
++	/* Disable DPI pixel output first to avoid underrun storm, then bridge */
++	writel(readl(b + DSI_BRG_DPI_MISC_CFG) & ~BIT(0),
++	       b + DSI_BRG_DPI_MISC_CFG);
++	writel(BIT(0), b + DSI_BRG_DPI_CFG_UPDATE);
++	writel(0u, b + DSI_BRG_EN);
++}
++
++/*
++ * Copy a DRM framebuffer into fb_cpu, applying the 90° CCW rotation
++ * needed to cancel out the BONO panel's locked-MV-bit rotation
++ * (panel-locked MV bit). Returns true if the copy ran.
++ *
++ * Cheap enough at fbcon update rates — full transpose of 720×720
++ * RGB565 (~1 MB) takes a handful of ms. If this becomes a bottleneck,
++ * the right answer is to reprogram GDMA to walk the buffer in
++ * column-major order rather than copy-with-rotate every commit.
++ *
++ * Used in two places:
++ *   - esp32p4_dsi_pipe_update on every atomic commit
++ *   - end of esp32p4_dsi_dpi_enable_work as a one-shot catch-up for
++ *     any commits that fired before fb_cpu was allocated
++ */
++/*
++ * Tiled transpose: small enough that one source-column cache line stays
++ * hot across all 16 row-iterations of the tile, instead of the original
++ * per-pixel stride-W*2 reads that thrashed L1D. With TILE=16, a 16×16
++ * RGB565 tile is 512 B src + 512 B dst — fits comfortably in L1. 720 is
++ * an exact multiple of 16 so there is no edge case to handle.
++ *
++ * Brings the 720×720 blit from ~200 ms (limiting fbdefio to ~5 Hz) down
++ * to well under the 50 ms defio cycle.
++ */
++#define ESP32P4_BLIT_TILE 16
++
++static bool esp32p4_dsi_blit_fb(struct esp32p4_dsi *dsi,
++				struct drm_framebuffer *fb,
++				u32 src_y)
++{
++	struct drm_gem_dma_object *src_obj;
++	u16 *src, *dst;
++	u32 W, H, src_stride_px, br, bc, r, c;
++
++	if (!fb || !dsi->fb_cpu)
++		return false;
++
++	src_obj = to_drm_gem_dma_obj(drm_gem_fb_get_obj(fb, 0));
++	if (!src_obj || !src_obj->vaddr)
++		return false;
++
++	W = dsi->hdisp_cache;
++	H = dsi->vdisp_cache;
++	src_stride_px = fb->pitches[0] / 2;
++	/*
++	 * Honor plane_state->src_y. fbcon can switch into pan/wrap scroll
++	 * modes — the DRM core advances the plane's src_y on each scroll
++	 * and we must read from the offset window, otherwise the screen
++	 * shows the gem buffer at fixed [0..H-1] while fbcon writes new
++	 * lines past the visible window: the most recent line shows up
++	 * at the top of the panel and the rest "moves down by one line"
++	 * — exact symptom seen on the badge.
++	 */
++	src = (u16 *)src_obj->vaddr + src_y * src_stride_px;
++	dst = (u16 *)dsi->fb_cpu;
++
++	/*
++	 * Bridge/DPI timing on this silicon shows pixels at panel_y =
++	 * (dst_col + 16) mod H — we measured this empirically with a
++	 * corner-color test. We don't yet know which IDF init step we're
++	 * missing to remove this 16-pixel-deterministic offset; until
++	 * then, compensate at blit-time by reading the source row shifted
++	 * by +16 (i.e. "dst column C will be panel row (C+16) mod H, so
++	 * read whatever should land at panel row (C+16) mod H, which is
++	 * gem-y (C+16) mod H").
++	 *
++	 * One font row exactly. Smells like a vsync-line miscount but
++	 * could also be a bridge FIFO depth mismatch — IDF programs more
++	 * registers (raw_buf_credit, dma_block_interval, etc) we leave at
++	 * reset defaults. Worth revisiting once typing input is live.
++	 */
++#define ESP32P4_PANEL_VSHIFT 16
++	dev_info_once(dsi->dev,
++		      "blit: 90° CCW rotation + %d-px panel vshift workaround active "
++		      "(panel_y = (dst_col + %d) mod H); see comment above ESP32P4_PANEL_VSHIFT\n",
++		      ESP32P4_PANEL_VSHIFT, ESP32P4_PANEL_VSHIFT);
++
++	for (br = 0; br < H; br += ESP32P4_BLIT_TILE) {
++		for (bc = 0; bc < W; bc += ESP32P4_BLIT_TILE) {
++			for (r = br; r < br + ESP32P4_BLIT_TILE; r++) {
++				u16 *dst_row = dst + r * W;
++				u32 src_col_off = (W - 1 - r);
++				for (c = bc; c < bc + ESP32P4_BLIT_TILE; c++) {
++					u32 src_row = (c + ESP32P4_PANEL_VSHIFT) % H;
++					dst_row[c] = src[src_row * src_stride_px + src_col_off];
++				}
++			}
++		}
++	}
++
++	esp32p4_dsi_psram_flush(dsi->fb_cpu, dsi->fb_size);
++	return true;
++}
++
++/*
++ * Called on every atomic commit that targets this pipe (fbcon writes,
++ * userspace KMS clients, etc.). The DRM core has prepared a new
++ * drm_framebuffer in plane_state->fb backed by a CMA gem object.
++ *
++ * Early in boot this can fire before dpi_enable_work has allocated
++ * fb_cpu (gdma_arm). Those commits can't be serviced; they're caught
++ * up by the explicit blit at the end of dpi_enable_work.
++ */
++static void esp32p4_dsi_pipe_update(struct drm_simple_display_pipe *pipe,
++				    struct drm_plane_state *old_state)
++{
++	struct esp32p4_dsi *dsi = container_of(pipe, struct esp32p4_dsi, pipe);
++	struct drm_plane_state *state = pipe->plane.state;
++	static int count;
++	static u32 last_src_y = (u32)-1;
++	u32 src_y = (state && state->fb) ? (state->src_y >> 16) : 0;
++
++	if (src_y != last_src_y) {
++		dev_dbg(dsi->dev,
++			"pipe_update: src_y %u -> %u (fbcon pan/wrap %s)\n",
++			last_src_y, src_y,
++			src_y ? "active" : "cleared");
++		last_src_y = src_y;
++	}
++
++	if (!esp32p4_dsi_blit_fb(dsi, state ? state->fb : NULL, src_y)) {
++		dev_dbg(dsi->dev,
++			"pipe_update #%d: skip (fb=%p fb_cpu=%p)\n",
++			count++, state ? state->fb : NULL, dsi->fb_cpu);
++		return;
++	}
++
++	/*
++	 * Defio fires up to 20 Hz during shell activity. First three
++	 * commits prove the path is live (boot diagnostic); past that
++	 * the per-update log is just noise on the same UART we're
++	 * watching.
++	 */
++	if (count < 3) {
++		struct drm_gem_dma_object *src_obj =
++			to_drm_gem_dma_obj(drm_gem_fb_get_obj(state->fb, 0));
++		u32 *s = src_obj->vaddr;
++
++		dev_dbg(dsi->dev,
++			"pipe_update #%d: rotated %ux%u from gem@%pK; src[0..3]=%08x %08x %08x %08x\n",
++			count, dsi->hdisp_cache, dsi->vdisp_cache,
++			src_obj->vaddr, s[0], s[1], s[2], s[3]);
++	}
++	count++;
++}
++
++static const struct drm_simple_display_pipe_funcs esp32p4_pipe_funcs = {
++	.enable		= esp32p4_dsi_pipe_enable,
++	.disable	= esp32p4_dsi_pipe_disable,
++	.update		= esp32p4_dsi_pipe_update,
++	/* prepare_fb: omitted — drm_gem_plane_helper_prepare_fb called auto */
++};
++
++/* ---------- DRM device ---------------------------------------------------- */
++
++/*
++ * Gate 5c stage 1: stand up a drm_device so /sys/class/drm/card0 exists.
++ *
++ * At this stage there are no CRTCs, no encoders, and no planes. The card
++ * will register as a DRIVER_MODESET device with 0 outputs — userspace can
++ * open it, list resources, and see nothing. That's fine. Subsequent stages
++ * in 0008..0012 fill in the pipe, attach the DW-MIPI-DSI bridge, program
++ * the Espressif bridge / DW-GDMA, and wire the MODE_CFG quirk from
++ * Finding #1.
++ *
++ * Kept deliberately minimal: if this stage won't probe, there's no point
++ * wiring anything further.
++ *
++ * Reference skeleton: drivers/gpu/drm/tiny/arcpgu.c (same pattern — small
++ * DRM driver that owns a drm_device, uses drm_gem_dma for framebuffers,
++ * attaches a bridge onto a simple_display_pipe).
++ */
++
++static const struct drm_mode_config_funcs esp32p4_dsi_mode_config_funcs = {
++	/*
++	 * _with_dirty installs drm_atomic_helper_dirtyfb as the fb's
++	 * ->dirty op. drm_fbdev_dma_helper_fb_probe checks fb->funcs->dirty
++	 * to decide whether to enable deferred-IO; without this, fbcon
++	 * writes to the gem-dma vmap go untracked and pipe_update never
++	 * fires for shell output. With defio on, the fbdefio worker
++	 * (HZ/20 = 50 ms) issues a damage atomic commit on dirty pages,
++	 * which routes through the simple-pipe to esp32p4_dsi_pipe_update
++	 * → blit_fb → live screen refresh.
++	 */
++	.fb_create	= drm_gem_fb_create_with_dirty,
++	.atomic_check	= drm_atomic_helper_check,
++	.atomic_commit	= drm_atomic_helper_commit,
++};
++
++DEFINE_DRM_GEM_DMA_FOPS(esp32p4_dsi_drm_fops);
++
++static const struct drm_driver esp32p4_dsi_drm_driver = {
++	.driver_features = DRIVER_MODESET | DRIVER_GEM | DRIVER_ATOMIC,
++	.name		= "esp32p4-dsi",
++	.desc		= "Espressif ESP32-P4 MIPI-DSI",
++	.major		= 0,
++	.minor		= 1,
++	.fops		= &esp32p4_dsi_drm_fops,
++	DRM_GEM_DMA_DRIVER_OPS,
++	DRM_FBDEV_DMA_DRIVER_OPS,
++};
++
++/*
++ * BONO is 720×720. Give DRM plenty of headroom — this governs fb_create
++ * validation and the connector probe path later, not the video-timing
++ * registers.
++ */
++static int esp32p4_dsi_drm_init(struct esp32p4_dsi *dsi)
++{
++	struct drm_device *drm = &dsi->drm;
++	struct drm_bridge *bridge;
++	int ret;
++
++	ret = drmm_mode_config_init(drm);
++	if (ret)
++		return ret;
++
++	drm->mode_config.min_width  = 0;
++	drm->mode_config.min_height = 0;
++	drm->mode_config.max_width  = 2048;
++	drm->mode_config.max_height = 2048;
++	drm->mode_config.funcs      = &esp32p4_dsi_mode_config_funcs;
++
++	/*
++	 * Stand up the display pipe: one primary plane (RGB565), one CRTC,
++	 * one encoder. Pass NULL for connector — the connector comes from the
++	 * DW-MIPI-DSI bridge chain (panel bridge creates it during attach).
++	 */
++	ret = drm_simple_display_pipe_init(drm, &dsi->pipe, &esp32p4_pipe_funcs,
++					   esp32p4_dsi_formats,
++					   ARRAY_SIZE(esp32p4_dsi_formats),
++					   NULL, NULL);
++	if (ret)
++		return ret;
++
++	/*
++	 * Required by drm_gem_fb_create_with_dirty: lets the atomic damage
++	 * machinery attach FB_DAMAGE_CLIPS to plane state. Without it the
++	 * fbdefio path silently degrades to full-frame damage on every
++	 * worker tick, which still works but can't propagate clip rects.
++	 */
++	drm_plane_enable_fb_damage_clips(&dsi->pipe.plane);
++
++	/*
++	 * Attach the Synopsys DW-MIPI-DSI bridge. This triggers:
++	 *   dw_mipi_dsi_bridge_attach → drm_of_find_panel_or_bridge →
++	 *   panel_bridge_attach → st7703_get_modes (modes from panel driver).
++	 * After this call the connector is live and userspace can enumerate it.
++	 */
++	bridge = dw_mipi_dsi_get_bridge(dsi->dmd);
++	ret = drm_simple_display_pipe_attach_bridge(&dsi->pipe, bridge);
++	if (ret)
++		return ret;
++
++	drm_kms_helper_poll_init(drm);
++
++	/*
++	 * Reset all state machines to their initial values. Must happen after
++	 * all objects are registered but before drm_dev_register opens the
++	 * device to userspace.
++	 */
++	drm_mode_config_reset(drm);
++
++	return 0;
++}
++
++/* ---------- probe/remove ------------------------------------------------ */
++
++static int esp32p4_dsi_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct esp32p4_dsi *dsi;
++	int ret;
++
++	/*
++	 * devm_drm_dev_alloc replaces the devm_kzalloc we had before: it
++	 * allocates + initialises a drm_device embedded in struct
++	 * esp32p4_dsi. Freed automatically when the platform device goes
++	 * away.
++	 */
++	dsi = devm_drm_dev_alloc(dev, &esp32p4_dsi_drm_driver,
++				 struct esp32p4_dsi, drm);
++	if (IS_ERR(dsi))
++		return PTR_ERR(dsi);
++
++	dsi->dev = dev;
++	platform_set_drvdata(pdev, dsi);
++	INIT_DELAYED_WORK(&dsi->dpi_enable_work, esp32p4_dsi_dpi_enable_work);
++	INIT_DELAYED_WORK(&dsi->fbdev_setup_work, esp32p4_dsi_fbdev_setup_work);
++
++	/*
++	 * All framebuffers live in the CMA region declared as display_cma
++	 * in DT (see phase3-display.dtsi). The DW-GDMA downstream of the
++	 * Espressif bridge is a 32-bit master.
++	 */
++	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
++	if (ret)
++		return dev_err_probe(dev, ret, "32-bit DMA mask rejected\n");
++
++	dsi->host_regs = devm_platform_ioremap_resource_byname(pdev, "host");
++	if (IS_ERR(dsi->host_regs))
++		return dev_err_probe(dev, PTR_ERR(dsi->host_regs),
++				     "failed to map DW-MIPI-DSI host regs\n");
++
++	dsi->bridge_regs = devm_platform_ioremap_resource_byname(pdev, "bridge");
++	if (IS_ERR(dsi->bridge_regs))
++		return dev_err_probe(dev, PTR_ERR(dsi->bridge_regs),
++				     "failed to map Espressif bridge regs\n");
++
++	/*
++	 * DW-GDMA — not declared in DT (no upstream binding for it on P4).
++	 * Map directly. devm_ioremap on a fixed phys/length is fine.
++	 */
++	dsi->gdma_regs = devm_ioremap(dev, ESP32P4_GDMA_BASE, ESP32P4_GDMA_SIZE);
++	if (!dsi->gdma_regs)
++		return dev_err_probe(dev, -ENOMEM,
++				     "failed to map DW-GDMA regs\n");
++
++	dsi->phy_supply = devm_regulator_get(dev, "phy");
++	if (IS_ERR(dsi->phy_supply))
++		return dev_err_probe(dev, PTR_ERR(dsi->phy_supply),
++				     "failed to get phy-supply\n");
++
++	/*
++	 * Always-on in DT for now (LDO3 pre-enabled by boot shim); enable()
++	 * is still required so the regulator refcount is correct when a
++	 * real P4 LDO driver lands.
++	 */
++	ret = regulator_enable(dsi->phy_supply);
++	if (ret)
++		return dev_err_probe(dev, ret, "failed to enable phy-supply\n");
++
++	/*
++	 * Before touching any DSI host register, make sure the SoC-level
++	 * clock gates and bridge reset are in a known state. See
++	 * esp32p4_dsi_clkrst_audit() for the why.
++	 */
++	esp32p4_dsi_clkrst_audit(dev);
++
++	/*
++	 * IDF golden has DSI_BRG_CLK_EN (offset 0x000) = 0. The
++	 * mipi_dsi_brg_ll_force_enable_reg_clock() helper exists but is
++	 * never called anywhere in IDF's source tree. Earlier we forced
++	 * this to 1 with an "IDF does this" rationale that was wrong;
++	 * doing so apparently interferes with the bridge's DSI forwarding
++	 * logic on the v1.x silicon — leaving it at the reset default of
++	 * 0 (dynamically gated) is what produces working video in IDF.
++	 *
++	 * Also enable underrun interrupt (int_ena bit 0 = 1) to match IDF
++	 * golden 0x050 = 0x1. Just the interrupt enable, not the handler;
++	 * we'll see in dmesg if it ever fires.
++	 */
++	writel(0, dsi->bridge_regs + DSI_BRG_CLK_EN);
++	writel(BIT(0), dsi->bridge_regs + 0x50); /* int_ena: underrun */
++
++	/*
++	 * Turn on LDO3 (2500 mV) for the DSI PHY analog supply. Boot shim
++	 * doesn't, and without it the PHY PLL cannot lock. See
++	 * esp32p4_dsi_ldo3_enable() for the rationale.
++	 */
++	esp32p4_dsi_ldo3_enable(dev);
++
++	dsi->rst = devm_reset_control_get_optional_exclusive(dev, NULL);
++	if (IS_ERR(dsi->rst)) {
++		ret = PTR_ERR(dsi->rst);
++		goto err_regulator;
++	}
++
++	reset_control_deassert(dsi->rst);
++
++	/* Compose plat_data and hand off to the Synopsys bridge driver. */
++	dsi->pdata.base = dsi->host_regs;
++	dsi->pdata.max_data_lanes = ESP32P4_DSI_MAX_LANES;
++	dsi->pdata.phy_ops = &esp32p4_dsi_phy_ops;
++	dsi->pdata.host_ops = &esp32p4_dsi_host_ops;
++	dsi->pdata.priv_data = dsi;
++	/*
++	 * v5: skip the DW core's set_mode(VIDEO) in atomic_enable. Panel init
++	 * DCS must run in CMD mode (IDF-style), so dpi_enable_work performs
++	 * the VIDEO transition later via dw_mipi_dsi_late_enable_video().
++	 */
++	dsi->pdata.defer_video_mode_switch = true;
++
++	dsi->dmd = dw_mipi_dsi_probe(pdev, &dsi->pdata);
++	if (IS_ERR(dsi->dmd)) {
++		ret = dev_err_probe(dev, PTR_ERR(dsi->dmd),
++				    "dw_mipi_dsi_probe failed\n");
++		goto err_reset;
++	}
++
++	/*
++	 * mipi_dsi_host_register (called inside dw_mipi_dsi_probe) creates
++	 * the panel mipi_dsi_device from DT. If the panel driver is registered
++	 * AND all its dependencies are ready, its probe runs synchronously,
++	 * calls mipi_dsi_attach(), which calls our host_attach callback, which
++	 * sets dsi->host_attached = true. drm_init then has dsi->panel_bridge
++	 * available via dw_mipi_dsi's internal state.
++	 *
++	 * If the panel probe defers (e.g., a regulator/gpio dep not yet ready),
++	 * host_attached stays false. drm_init's bridge attach would then fail
++	 * with -EINVAL because dsi->panel_bridge is NULL. Defer our own probe
++	 * so the kernel retries us after all panel deps come up.
++	 */
++	if (!dsi->host_attached) {
++		dev_dbg(dev, "panel mipi_dsi_attach not yet called; deferring probe\n");
++		dw_mipi_dsi_remove(dsi->dmd);
++		ret = -EPROBE_DEFER;
++		goto err_reset;
++	}
++
++	/*
++	 * Gate 5c stage 1: init mode_config and register the drm_device so
++	 * userspace sees /sys/class/drm/card0. No CRTCs/encoders/planes yet;
++	 * those land in 0008..0012.
++	 */
++	ret = esp32p4_dsi_drm_init(dsi);
++	if (ret) {
++		dev_err_probe(dev, ret, "drm mode_config init failed\n");
++		goto err_dw_dsi;
++	}
++
++	ret = drm_dev_register(&dsi->drm, 0);
++	if (ret) {
++		dev_err_probe(dev, ret, "drm_dev_register failed\n");
++		goto err_dw_dsi;
++	}
++
++	/*
++	 * Trigger DRM client setup (fbdev_probe callback). Without this,
++	 * 6.18's new client framework never invokes drm_fbdev_dma_driver_fbdev_probe
++	 * and /dev/fb0 is never created — the panel comes up electrically
++	 * but fbcon never attaches.
++	 *
++	 * Deferred to give the buddy heap time to settle past sensor probes
++	 * (BMI270 firmware upload over bit-banged I²C is the worst offender,
++	 * fragmenting memory enough that the 1 MB shadow vzalloc fails).
++	 */
++	schedule_delayed_work(&dsi->fbdev_setup_work, 3 * HZ);
++
++	/*
++	 * Start fbdev emulation so the kernel issues an initial atomic
++	 * mode-set without needing a userspace compositor. This is what
++	 * fires pipe_enable for the first time (→ DPI_OUTPUT_EN → HS
++	 * traffic → C6 turns on the backlight). Bpp=16 matches RGB565.
++	 *
++	 * Linux 6.18: fbdev probe is now wired via the drm_driver
++	 * .fbdev_probe callback (DRM_FBDEV_DMA_DRIVER_OPS macro), so
++	 * drm_fbdev_dma_setup() is no longer called explicitly.
++	 */
++
++	dev_info(dev,
++		 "esp32p4-mipi-dsi: registered (%u lanes @ %u Mbps)\n",
++		 ESP32P4_DSI_MAX_LANES, ESP32P4_DSI_LANE_MBPS);
++	return 0;
++
++err_dw_dsi:
++	dw_mipi_dsi_remove(dsi->dmd);
++err_reset:
++	reset_control_assert(dsi->rst);
++err_regulator:
++	regulator_disable(dsi->phy_supply);
++	return ret;
++}
++
++static void esp32p4_dsi_remove(struct platform_device *pdev)
++{
++	struct esp32p4_dsi *dsi = platform_get_drvdata(pdev);
++
++	drm_dev_unregister(&dsi->drm);
++	drm_kms_helper_poll_fini(&dsi->drm);
++	dw_mipi_dsi_remove(dsi->dmd);
++	reset_control_assert(dsi->rst);
++	regulator_disable(dsi->phy_supply);
++}
++
++static const struct of_device_id esp32p4_dsi_of_match[] = {
++	{ .compatible = "espressif,esp32p4-mipi-dsi" },
++	{ /* sentinel */ }
++};
++MODULE_DEVICE_TABLE(of, esp32p4_dsi_of_match);
++
++static struct platform_driver esp32p4_dsi_driver = {
++	.probe	= esp32p4_dsi_probe,
++	.remove	= esp32p4_dsi_remove,
++	.driver	= {
++		.name		= "esp32p4-mipi-dsi",
++		.of_match_table	= esp32p4_dsi_of_match,
++	},
++};
++module_platform_driver(esp32p4_dsi_driver);
++
++MODULE_AUTHOR("WHY2025 Linux port");
++MODULE_DESCRIPTION("Espressif ESP32-P4 MIPI-DSI glue (DW-MIPI-DSI wrapper)");
++MODULE_LICENSE("GPL");

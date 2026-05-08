@@ -1,0 +1,242 @@
+--- a/drivers/misc/Kconfig	2026-04-30 11:13:53.000000000 +0200
++++ b/drivers/misc/Kconfig	2026-05-05 11:14:25.086596762 +0200
+@@ -594,6 +594,18 @@
+ 	  This driver can also be built as a module.  If so, the module
+ 	  will be called tps6594-pfsm.
+ 
++config ESP32_C6_KICK
++	tristate "Espressif ESP32-C6 kick-to-run driver (WHY2025 badge)"
++	depends on GPIOLIB && OF
++	default n
++	help
++	  On the WHY2025 badge (ESP32-P4 + ESP32-C6), the backlight LED is
++	  driven by the C6 running network_adapter.elf. This driver toggles
++	  the C6 reset and boot-mode GPIOs from the P4 side so the C6 starts
++	  up in app-boot mode at probe time, matching the ESP-IDF reference.
++
++	  If unsure, say N.
++
+ config NSM
+ 	tristate "Nitro (Enclaves) Security Module support"
+ 	depends on VIRTIO
+--- a/drivers/misc/Makefile	2026-04-30 11:13:53.000000000 +0200
++++ b/drivers/misc/Makefile	2026-05-07 17:15:48.807679220 +0200
+@@ -3,6 +3,7 @@
+ # Makefile for misc devices that really don't fit anywhere else.
+ #
+ 
++# obj-y				+= esp32p4-watchdog-blink.o  # debug-only, see drivers/misc/esp32p4-watchdog-blink.c
+ obj-$(CONFIG_IBM_ASM)		+= ibmasm/
+ obj-$(CONFIG_IBMVMC)		+= ibmvmc.o
+ obj-$(CONFIG_AD525X_DPOT)	+= ad525x_dpot.o
+@@ -75,3 +76,4 @@
+ obj-y				+= keba/
+ obj-y				+= amd-sbi/
+ obj-$(CONFIG_MISC_RP1)		+= rp1/
++obj-$(CONFIG_ESP32_C6_KICK)	+= esp32-c6-kick.o
+--- /dev/null	2026-05-03 14:38:22.219445125 +0200
++++ b/drivers/misc/esp32-c6-kick.c	2026-05-05 11:14:25.096805168 +0200
+@@ -0,0 +1,203 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Espressif ESP32-C6 "kick" driver — WHY2025 badge backlight workaround.
++ *
++ * The badge has no HP-core-routed backlight enable pin; the LED driver
++ * sits behind the ESP32-C6 coprocessor, which runs a stock
++ * network_adapter.elf firmware that drives backlight PWM as a side
++ * effect of booting. Until SDMMC + a real C6 control
++ * channel, the only thing Linux must do is release the C6 out of reset
++ * in "app boot" mode at startup and wait for it to come up.
++ *
++ * The GPIO sequence mirrors ESP-IDF's kick_c6_into_run_mode() in
++ * linux-native-scratch/main/main.c:
++ *
++ *   bootmode = 1         (C6 GPIO0 high → boot app image, not flasher)
++ *   reset    = 1         (idle)
++ *   sleep 5 ms
++ *   reset    = 0         (assert reset)
++ *   sleep 20 ms
++ *   reset    = 1         (release; C6 boots network_adapter.elf)
++ *   sleep 1000 ms        (wait for app to start driving backlight PWM)
++ *
++ * On the badge these are wired to HP-core GPIO 12 (reset) and GPIO 13
++ * (bootmode). The mapping comes from DT so this driver is not board-
++ * specific beyond the compatible string.
++ */
++
++#include <linux/delay.h>
++#include <linux/gpio/consumer.h>
++#include <linux/io.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++
++/*
++ * IO_MUX pad config registers (ESP32-P4).
++ *
++ *   DR_REG_IO_MUX_BASE = DR_REG_HPPERIPH1_BASE (0x500C0000) + 0x21000
++ *                       = 0x500E1000
++ *   PERIPHS_IO_MUX_U_PAD_GPIO12 @ base + 0x34 = 0x500E1034
++ *   PERIPHS_IO_MUX_U_PAD_GPIO13 @ base + 0x38 = 0x500E1038
++ *
++ * Each pad register:
++ *   bits 14:12  MCU_SEL  (function select; 1 = GPIO matrix)
++ *   bit  9      FUN_IE   (input enable — set so the IN register reads
++ *                         back the real pad level)
++ *
++ * Without forcing MCU_SEL=1, our GPIO matrix writes never reach the
++ * pad: the bootrom / IDF bootloader leaves these pins muxed to their
++ * default function on ESP32-P4, not the GPIO matrix. The symptom is
++ * our gpio driver happily driving GPIO_OUT while the IN register keeps
++ * reading 0 — exactly what /sys/kernel/debug/gpio showed for the
++ * "bootmode" line (gpio-525) after probe on first attempt.
++ *
++ * Belongs in a pinctrl-esp32p4 driver eventually; poking directly from
++ * here is the minimum change to get backlight up.
++ */
++#define ESP32P4_IO_MUX_BASE		0x500E1000
++#define ESP32P4_IO_MUX_SIZE		0x1000
++#define IO_MUX_GPIO12_OFFSET		0x34
++#define IO_MUX_GPIO13_OFFSET		0x38
++#define IO_MUX_MCU_SEL_SHIFT		12
++#define IO_MUX_MCU_SEL_MASK		(0x7 << IO_MUX_MCU_SEL_SHIFT)
++#define IO_MUX_MCU_SEL_GPIO		(0x1 << IO_MUX_MCU_SEL_SHIFT)
++#define IO_MUX_FUN_IE			BIT(9)
++
++static void esp32_c6_kick_force_iomux_gpio(struct device *dev)
++{
++	void __iomem *iomux;
++	u32 pre12, pre13, post12, post13;
++
++	iomux = ioremap(ESP32P4_IO_MUX_BASE, ESP32P4_IO_MUX_SIZE);
++	if (!iomux) {
++		dev_warn(dev, "IO_MUX ioremap failed, skipping pad mux force\n");
++		return;
++	}
++
++	pre12 = readl(iomux + IO_MUX_GPIO12_OFFSET);
++	pre13 = readl(iomux + IO_MUX_GPIO13_OFFSET);
++
++	writel((pre12 & ~IO_MUX_MCU_SEL_MASK) | IO_MUX_MCU_SEL_GPIO |
++	       IO_MUX_FUN_IE, iomux + IO_MUX_GPIO12_OFFSET);
++	writel((pre13 & ~IO_MUX_MCU_SEL_MASK) | IO_MUX_MCU_SEL_GPIO |
++	       IO_MUX_FUN_IE, iomux + IO_MUX_GPIO13_OFFSET);
++
++	post12 = readl(iomux + IO_MUX_GPIO12_OFFSET);
++	post13 = readl(iomux + IO_MUX_GPIO13_OFFSET);
++
++	dev_info(dev,
++		 "IO_MUX: GPIO12 %#x -> %#x (MCU_SEL %u->%u), GPIO13 %#x -> %#x (MCU_SEL %u->%u)\n",
++		 pre12, post12,
++		 (pre12 & IO_MUX_MCU_SEL_MASK) >> IO_MUX_MCU_SEL_SHIFT,
++		 (post12 & IO_MUX_MCU_SEL_MASK) >> IO_MUX_MCU_SEL_SHIFT,
++		 pre13, post13,
++		 (pre13 & IO_MUX_MCU_SEL_MASK) >> IO_MUX_MCU_SEL_SHIFT,
++		 (post13 & IO_MUX_MCU_SEL_MASK) >> IO_MUX_MCU_SEL_SHIFT);
++
++	iounmap(iomux);
++}
++
++struct esp32_c6_kick {
++	struct device *dev;
++	struct gpio_desc *reset;	/* C6 CHIP_EN, active low */
++	struct gpio_desc *bootmode;	/* C6 GPIO0, high = app, low = flasher */
++};
++
++static int esp32_c6_kick_run(struct esp32_c6_kick *k)
++{
++	/*
++	 * gpiod_set_value() takes the LOGICAL level, honouring the
++	 * GPIO_ACTIVE_LOW flag in DT. The reset line is wired active-low
++	 * (electrical LOW = C6 held in reset). With reset-gpios marked
++	 * ACTIVE_LOW in DT, gpiod_set_value(reset, 1) means "assert reset"
++	 * → physical LOW; (reset, 0) means "release" → physical HIGH.
++	 *
++	 * Earlier code had this inverted and ended the sequence with
++	 * set_value(1), which (correctly per logical semantics) re-asserted
++	 * reset and stuck the C6 there → backlight off.
++	 */
++	gpiod_set_value_cansleep(k->bootmode, 1);	/* select app image */
++	gpiod_set_value_cansleep(k->reset, 0);		/* idle (deasserted/release) */
++	msleep(5);
++	gpiod_set_value_cansleep(k->reset, 1);		/* assert reset */
++	msleep(20);
++	gpiod_set_value_cansleep(k->reset, 0);		/* release */
++
++	/*
++	 * network_adapter.elf takes ~1 s to reach the point where it
++	 * programs the LED driver. We block probe for that long so anything
++	 * downstream that cares about "backlight is on" can rely on it
++	 * after our probe returns. This is crude; a proper solution is a
++	 * pwm-backlight bound through a real C6 channel.
++	 */
++	msleep(1000);
++	return 0;
++}
++
++static int esp32_c6_kick_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct esp32_c6_kick *k;
++	int ret;
++
++	k = devm_kzalloc(dev, sizeof(*k), GFP_KERNEL);
++	if (!k)
++		return -ENOMEM;
++	k->dev = dev;
++
++	/*
++	 * Force IO_MUX of GPIO12/13 to the GPIO matrix *before* requesting
++	 * the lines: devm_gpiod_get() + GPIOD_OUT_HIGH immediately drives
++	 * the pad, and those writes must reach the pad. See
++	 * esp32_c6_kick_force_iomux_gpio() for the rationale.
++	 */
++	esp32_c6_kick_force_iomux_gpio(dev);
++
++	/*
++	 * Initial logical levels:
++	 *   reset    = 0 (deasserted = physical HIGH given ACTIVE_LOW DT)
++	 *              — keep C6 running while we set up bootmode.
++	 *   bootmode = 1 (app boot, physical HIGH given ACTIVE_HIGH DT)
++	 *              — set strap before we pulse reset in run().
++	 * Boot shim already released C6, so requesting "reset deasserted"
++	 * here matches the existing physical state and avoids a glitch.
++	 */
++	k->reset = devm_gpiod_get(dev, "reset", GPIOD_OUT_LOW);
++	if (IS_ERR(k->reset))
++		return dev_err_probe(dev, PTR_ERR(k->reset),
++				     "failed to get reset-gpios\n");
++
++	k->bootmode = devm_gpiod_get(dev, "bootmode", GPIOD_OUT_HIGH);
++	if (IS_ERR(k->bootmode))
++		return dev_err_probe(dev, PTR_ERR(k->bootmode),
++				     "failed to get bootmode-gpios\n");
++
++	platform_set_drvdata(pdev, k);
++
++	ret = esp32_c6_kick_run(k);
++	if (ret)
++		return dev_err_probe(dev, ret, "C6 kick sequence failed\n");
++
++	dev_info(dev, "ESP32-C6 released in app-boot mode; backlight should be on\n");
++	return 0;
++}
++
++static const struct of_device_id esp32_c6_kick_of_match[] = {
++	{ .compatible = "espressif,esp32-c6-kick" },
++	{ /* sentinel */ }
++};
++MODULE_DEVICE_TABLE(of, esp32_c6_kick_of_match);
++
++static struct platform_driver esp32_c6_kick_driver = {
++	.probe = esp32_c6_kick_probe,
++	.driver = {
++		.name = "esp32-c6-kick",
++		.of_match_table = esp32_c6_kick_of_match,
++	},
++};
++module_platform_driver(esp32_c6_kick_driver);
++
++MODULE_AUTHOR("WHY2025 Linux port");
++MODULE_DESCRIPTION("Kick ESP32-C6 coprocessor into app-boot mode (backlight)");
++MODULE_LICENSE("GPL");

@@ -1,0 +1,127 @@
+--- a/main/sdio_slave_api.c	2026-05-07 18:53:47.791213771 +0200
++++ b/main/sdio_slave_api.c	2026-05-02 14:17:44.000000000 +0200
+@@ -17,6 +17,7 @@
+ #include <stdio.h>
+ #include <string.h>
+ #include <unistd.h>
++#include <inttypes.h>
+ #include "freertos/FreeRTOS.h"
+ #include "freertos/event_groups.h"
+ #include "driver/gpio.h"
+@@ -32,12 +33,20 @@
+ #include "stats.h"
+ #include "soc/gpio_reg.h"
+ #include "esp_fw_version.h"
++#include "esp_cache.h"
+ 
+ #define SDIO_DMA_ALIGNMENT_BYTES    4
+ #define SDIO_DMA_ALIGNMENT_MASK     (SDIO_DMA_ALIGNMENT_BYTES - 1)
+ #define IS_SDIO_DMA_ALIGNED(val)    (!((uint32_t)(val) & SDIO_DMA_ALIGNMENT_MASK))
+ 
+-static uint8_t sdio_slave_rx_buffer[RX_BUF_NUM][RX_BUF_SIZE];
++/* C6 D-cache line is 32 bytes.  SLC RX DMA writes physical SRAM and bypasses
++ * the CPU cache; buffers MUST be cache-line aligned so that
++ *   (a) each buffer's start sits on its own cache line, and
++ *   (b) esp_cache_msync(...,M2C) can invalidate lines without clobbering
++ *       neighbouring memory.
++ * RX_BUF_SIZE (2048) is already a multiple of 32 so size-side is fine. */
++static uint8_t sdio_slave_rx_buffer[RX_BUF_NUM][RX_BUF_SIZE]
++    __attribute__((aligned(32)));
+ 
+ static interface_context_t context;
+ static interface_handle_t if_handle_g;
+@@ -109,7 +118,7 @@
+     esp_err_t ret = ESP_OK;
+     sdio_slave_buf_handle_t handle = {0};
+     sdio_slave_config_t config = {
+-        .sending_mode       = SDIO_SLAVE_SEND_STREAM,
++        .sending_mode       = SDIO_SLAVE_SEND_PACKET,
+         .send_queue_size    = SDIO_SLAVE_QUEUE_SIZE,
+         .recv_buffer_size   = RX_BUF_SIZE,
+         .event_cb           = event_cb,
+@@ -150,8 +159,10 @@
+ 
+     ret = sdio_slave_initialize(&config);
+     if (ret != ESP_OK) {
++        ESP_LOGE(TAG, "sdio_slave_initialize failed: %d", ret);
+         return NULL;
+     }
++    ESP_LOGI(TAG, "sdio_slave_initialize OK");
+ 
+     gpio_config(&io_conf);
+ 
+@@ -161,6 +172,7 @@
+ 
+         ret = sdio_slave_recv_load_buf(handle);
+         if (ret != ESP_OK) {
++            ESP_LOGE(TAG, "sdio_slave_recv_load_buf[%d] failed: %d", i, ret);
+             sdio_slave_deinit();
+             return NULL;
+         }
+@@ -176,11 +188,14 @@
+                                SDIO_SLAVE_HOSTINT_BIT6 |
+                                SDIO_SLAVE_HOSTINT_BIT7);
+ 
++    ESP_LOGI(TAG, "sdio_slave_start calling...");
+     ret = sdio_slave_start();
+     if (ret != ESP_OK) {
++        ESP_LOGE(TAG, "sdio_slave_start failed: %d", ret);
+         sdio_slave_deinit();
+         return NULL;
+     }
++    ESP_LOGI(TAG, "sdio_slave_start OK");
+ 
+     memset(&if_handle_g, 0, sizeof(if_handle_g));
+     if_handle_g.state = INIT;
+@@ -384,15 +399,48 @@
+     header->checksum = htole16(compute_checksum(buf_handle.payload, buf_handle.payload_len));
+ #endif
+ 
+-    ret = sdio_slave_transmit(buf_handle.payload, buf_handle.payload_len);
++    /* Split transmit to find where it hangs: send_queue vs get_finished */
++    ESP_LOGI(TAG, "send_bootup: send_queue len=%d...", buf_handle.payload_len);
++    ret = sdio_slave_send_queue(buf_handle.payload, buf_handle.payload_len, NULL, portMAX_DELAY);
++    ESP_LOGI(TAG, "send_bootup: send_queue ret=%d", ret);
+     if (ret != ESP_OK) {
+-        ESP_LOGE(TAG, "sdio slave tx error, ret : 0x%x\r\n", ret);
++        ESP_LOGE(TAG, "sdio slave send_queue error: 0x%x", ret);
+         free(buf_handle.payload);
+         return ret;
+     }
+ 
++    /* Dump SLC0 interrupt registers immediately after send_queue to check invoker state.
++     * DR_REG_SLC_BASE=0x60017000: RAW=+0x4, ST=+0x8, ENA=+0xc
++     * Bit 16 = slc0_rx_done (the "invoker" bit used to arm send_new_packet).
++     * Bit 17 = slc0_rx_eof (fired when a full packet DMA completes).
++     * If RAW[16]=0, send_isr_invoker_enable never armed correctly or was cleared. */
++    {
++        volatile uint32_t *slc_raw = (volatile uint32_t *)0x60017004UL;
++        volatile uint32_t *slc_st  = (volatile uint32_t *)0x60017008UL;
++        volatile uint32_t *slc_ena = (volatile uint32_t *)0x6001700cUL;
++        uint32_t raw = *slc_raw, st = *slc_st, ena = *slc_ena;
++        ESP_LOGI(TAG, "SLC0INT: RAW=0x%08" PRIx32 " ST=0x%08" PRIx32 " ENA=0x%08" PRIx32, raw, st, ena);
++        ESP_LOGI(TAG, "  invoker(bit16): raw=%d ena=%d st=%d  eof(bit17): raw=%d",
++                 !!(raw & BIT(16)), !!(ena & BIT(16)), !!(st & BIT(16)), !!(raw & BIT(17)));
++    }
++
++    /* Read PKT_LEN register directly: non-zero means send_new_packet ran */
++    {
++        /* C6: DR_REG_SLCHOST_BASE=0x60018000, PKT_LEN offset=0x60 */
++        volatile uint32_t *pkt_len = (volatile uint32_t *)0x60018060UL;
++        vTaskDelay(pdMS_TO_TICKS(10));
++        ESP_LOGI(TAG, "send_bootup: PKT_LEN reg=0x%08" PRIx32 " (0=send_new_packet never ran)", *pkt_len);
++    }
++
++    ESP_LOGI(TAG, "send_bootup: get_finished (5s timeout)...");
++    {
++        void *arg = NULL;
++        ret = sdio_slave_send_get_finished(&arg, pdMS_TO_TICKS(5000));
++    }
++    ESP_LOGI(TAG, "send_bootup: get_finished ret=%d", ret);
++
+     free(buf_handle.payload);
+-    return ESP_OK;
++    return ret;
+ }
+ 
+ static int sdio_read(interface_handle_t *if_handle, interface_buffer_handle_t *buf_handle)

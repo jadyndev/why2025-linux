@@ -1,0 +1,98 @@
+--- a/main/app_main.c	2026-05-07 18:53:47.790787605 +0200
++++ b/main/app_main.c	2026-05-05 17:00:47.000000000 +0200
+@@ -44,10 +44,57 @@
+ #endif
+ #include "endian.h"
+ 
++#include "driver/ledc.h"
++
+ #include "slave_bt.c"
+ #include "stats.h"
+ #include "esp_mac.h"
+ 
++/* WHY2025 BadgeVMS-style LEDC backlight init.
++ * GPIO 15 = display BL (channel 0, runtime-controllable from the host
++ * via CMD_SET_BACKLIGHT), GPIO 10 = keyboard BL (channel 1, slave-fixed).
++ * The display channel's initial duty matches the host DT's
++ * default-brightness-level so the very first host .apply() doesn't flash.
++ */
++#define BL_PWM_RESOLUTION       LEDC_TIMER_8_BIT          /* 0..255 raw */
++#define BL_PWM_FREQ_HZ          25000                     /* well above audible */
++#define BL_PWM_CLK              LEDC_USE_XTAL_CLK
++#define BL_DISPLAY_GPIO         15
++#define BL_KEYBOARD_GPIO        10
++#define BL_DISPLAY_INITIAL_DUTY 76    /* ~30%; matches DT default-brightness-level */
++#define BL_KEYBOARD_DUTY        25    /* ~10% */
++
++static void why2025_backlight_init(void)
++{
++	ledc_timer_config_t timer_conf = {
++		.speed_mode      = LEDC_LOW_SPEED_MODE,
++		.duty_resolution = BL_PWM_RESOLUTION,
++		.timer_num       = LEDC_TIMER_0,
++		.freq_hz         = BL_PWM_FREQ_HZ,
++		.clk_cfg         = BL_PWM_CLK,
++	};
++	ESP_ERROR_CHECK(ledc_timer_config(&timer_conf));
++
++	const struct { int gpio; ledc_channel_t ch; uint32_t duty; } pins[] = {
++		{ BL_DISPLAY_GPIO,  LEDC_CHANNEL_0, BL_DISPLAY_INITIAL_DUTY },
++		{ BL_KEYBOARD_GPIO, LEDC_CHANNEL_1, BL_KEYBOARD_DUTY        },
++	};
++	for (size_t i = 0; i < sizeof(pins)/sizeof(pins[0]); i++) {
++		ledc_channel_config_t ch_conf = {
++			.gpio_num   = pins[i].gpio,
++			.speed_mode = LEDC_LOW_SPEED_MODE,
++			.channel    = pins[i].ch,
++			.intr_type  = LEDC_INTR_DISABLE,
++			.timer_sel  = LEDC_TIMER_0,
++			.duty       = 0,
++			.hpoint     = 0,
++		};
++		ESP_ERROR_CHECK(ledc_channel_config(&ch_conf));
++		ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE, pins[i].ch, pins[i].duty));
++		ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, pins[i].ch));
++	}
++}
++
+ static const char TAG[] = "FW_MAIN";
+ 
+ #if CONFIG_ESP_WLAN_DEBUG
+@@ -508,6 +555,10 @@
+         process_set_time(if_type, payload, payload_len);
+         break;
+ 
++    case CMD_SET_BACKLIGHT:
++        process_set_backlight(if_type, payload, payload_len);
++        break;
++
+     default:
+         ESP_LOGI(TAG, "Unsupported cmd[0x%x] received", header->cmd_code);
+         break;
+@@ -678,6 +729,8 @@
+ #ifdef CONFIG_BT_ENABLED
+     uint8_t mac[MAC_ADDR_LEN] = {0};
+ #endif
++    why2025_backlight_init();
++
+     debug_log_firmware_version();
+ 
+     capa = get_capabilities();
+@@ -748,6 +801,17 @@
+         send_bootup_event_to_host(capa);
+     }
+ 
++    /* C6 v0.2: the SLC TX descriptor self-consumes ~200ms after send_queue (silicon
++     * behavior) before P4 issues CMD53.  P4 tx_process retries OPEN_DATA_PATH every
++     * ~600ms until it successfully reads the capabilities packet and advances past
++     * ESP_CONTEXT_RX_READY.  Re-queue the bootup packet on every trigger so a live
++     * descriptor is present when P4's CMD53 arrives (P4 reduced its sleep to 100ms so
++     * CMD53 fires ~100ms after OPEN_DATA_PATH, within the ~200ms descriptor window). */
++    while (xSemaphoreTake(init_sem, portMAX_DELAY) == pdTRUE) {
++        ESP_LOGI(TAG, "send_bootup: re-triggered by OPEN_DATA_PATH from host");
++        send_bootup_event_to_host(capa);
++    }
++
+     debug_set_wifi_logging();
+     ESP_LOGI(TAG, "Initial set up done");
+ }

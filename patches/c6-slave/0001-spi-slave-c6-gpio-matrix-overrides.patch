@@ -1,0 +1,32 @@
+--- a/main/spi_slave_api.c	2026-05-07 18:53:47.791623229 +0200
++++ b/main/spi_slave_api.c	2026-05-07 18:30:11.805105823 +0200
+@@ -132,11 +132,25 @@
+ 
+ #elif defined CONFIG_IDF_TARGET_ESP32C6
+ 
++/*
++ * WHY2025 badge: the P4 host reaches the C6 over the badge's SDIO
++ * traces, repurposed via GPIO matrix on both ends. Verified
++ * that all 6 traces are end-to-end electrical (SDIO 4-bit ran clean
++ * at the bus level until the C6 v0.2 RX-FIFO→DMA silicon bug bit us).
++ *
++ * P4 host ↔ C6 slave (this file):
++ *   GPIO33 (MOSI)  ↔ GPIO18
++ *   GPIO28 (MISO)  ↔ GPIO20
++ *   GPIO32 (SCK)   ↔ GPIO19
++ *   GPIO31 (CS)    ↔ GPIO21
++ *   GPIO30 (HS)    ↔ GPIO22 (handshake — see Kconfig)
++ *   GPIO29 (DR)    ↔ GPIO23 (data ready — see Kconfig)
++ */
+ #define ESP_SPI_CONTROLLER      1
+-#define GPIO_MOSI           7
+-#define GPIO_MISO           2
+-#define GPIO_SCLK           6
+-#define GPIO_CS             10
++#define GPIO_MOSI           18
++#define GPIO_MISO           20
++#define GPIO_SCLK           19
++#define GPIO_CS             21
+ #define DMA_CHAN            SPI_DMA_CH_AUTO
+ 
+ #define SPI_CLK_MHZ         26

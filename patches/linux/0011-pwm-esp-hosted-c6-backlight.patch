@@ -1,0 +1,197 @@
+--- a/drivers/pwm/Kconfig	2026-04-30 11:13:53.000000000 +0200
++++ b/drivers/pwm/Kconfig	2026-05-05 17:08:41.363976318 +0200
+@@ -249,6 +249,17 @@
+ 	  To compile this driver as a module, choose M here: the module
+ 	  will be called pwm-ep93xx.
+ 
++config PWM_ESP_HOSTED_C6
++	bool "ESP32-C6 backlight PWM via esp-hosted-NG"
++	depends on ESP_HOSTED_NG
++	help
++	  PWM controller fronting the ESP32-C6 LEDC channel that drives the
++	  WHY2025 badge display backlight. Each .apply() forwards a 0..255
++	  brightness over SPI through esp-hosted-NG to the C6's LEDC.
++
++	  Built-in only — same constraint as the parent ESP_HOSTED_NG
++	  driver (RV32 NOMMU has no module loader).
++
+ config PWM_FSL_FTM
+ 	tristate "Freescale FlexTimer Module (FTM) PWM support"
+ 	depends on HAS_IOMEM
+--- a/drivers/pwm/Makefile	2026-04-30 11:13:53.000000000 +0200
++++ b/drivers/pwm/Makefile	2026-05-05 17:08:43.504925988 +0200
+@@ -20,6 +20,7 @@
+ obj-$(CONFIG_PWM_DWC_CORE)	+= pwm-dwc-core.o
+ obj-$(CONFIG_PWM_DWC)		+= pwm-dwc.o
+ obj-$(CONFIG_PWM_EP93XX)	+= pwm-ep93xx.o
++obj-$(CONFIG_PWM_ESP_HOSTED_C6)	+= pwm-esp-hosted-c6.o
+ obj-$(CONFIG_PWM_FSL_FTM)	+= pwm-fsl-ftm.o
+ obj-$(CONFIG_PWM_GPIO)		+= pwm-gpio.o
+ obj-$(CONFIG_PWM_HIBVT)		+= pwm-hibvt.o
+--- /dev/null	2026-05-03 14:38:22.219445125 +0200
++++ b/drivers/pwm/pwm-esp-hosted-c6.c	2026-05-07 08:39:49.731804480 +0200
+@@ -0,0 +1,164 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * PWM controller driver fronting the ESP32-C6 LEDC channel that drives
++ * the WHY2025 badge display backlight.
++ *
++ * Hardware: the only LED-PWM peripheral wired to the backlight pin
++ * (GPIO 15 on the C6) lives on the radio coprocessor. The HP RV32 core
++ * we run Linux on has no register access to it. Each PWM update has to
++ * traverse host -> SPI -> esp-hosted-NG -> C6 -> LEDC. The slave runs at
++ * 25 kHz, 8-bit resolution, single channel; the only knob the host gets
++ * is "duty 0..255".
++ *
++ * Wire format: CMD_SET_BACKLIGHT (slot 32) carries one u8 brightness on
++ * the standard NG cmd queue. Latency per write is dominated by SPI
++ * round-trip (~5 ms). pwm-backlight only fires one .apply() per
++ * brightness write, so this is fine for sysfs dimming and userspace
++ * fade scripts.
++ *
++ * The driver doesn't program a period: the C6 is hard-wired to 25 kHz.
++ * pwm-backlight passes period via DT; we ignore the absolute value and
++ * use only the duty:period ratio when scaling to 0..255.
++ *
++ * Probe ordering: esp-hosted-NG has to finish its caps exchange with
++ * the slave before CMD_SET_BACKLIGHT is meaningful. Probe defers until
++ * esp_hosted_get_ready_adapter() returns non-NULL, and esp-hosted's
++ * process_event_esp_bootup() calls driver_deferred_probe_trigger() on
++ * caps-done to retry us.
++ */
++
++#include <linux/device.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/pwm.h>
++
++#include "../net/wireless/espressif/esp_hosted/include/esp_cmd.h"
++
++#define ESP_C6_PWM_MAX_DUTY	255U
++
++struct esp_c6_pwm {
++	struct esp_adapter *adapter;
++	struct pwm_state cached;
++	bool probe_apply_skipped;
++};
++
++static int esp_c6_pwm_apply(struct pwm_chip *chip, struct pwm_device *pwm,
++			    const struct pwm_state *state)
++{
++	struct esp_c6_pwm *priv = pwmchip_get_drvdata(chip);
++	u32 brightness;
++	int ret;
++
++	if (state->polarity != PWM_POLARITY_NORMAL)
++		return -EINVAL;
++
++	if (!state->enabled || state->duty_cycle == 0) {
++		brightness = 0;
++	} else if (state->period == 0) {
++		return -EINVAL;
++	} else {
++		/*
++		 * RV32 kernel doesn't link u64/u64 helpers cleanly under all
++		 * toolchain configs (mult_frac uses /, % on typeof(x)). The
++		 * pwm-backlight always passes a 40000 ns period from DT and
++		 * a duty bounded by it, both well within u32 — clamp + cast
++		 * + do_div to keep the math 32-bit-safe.
++		 */
++		u64 num;
++		u32 period32, duty32;
++
++		period32 = (state->period > U32_MAX) ? U32_MAX : (u32)state->period;
++		duty32 = (state->duty_cycle > state->period) ? period32 :
++			 (u32)state->duty_cycle;
++		num = (u64)duty32 * ESP_C6_PWM_MAX_DUTY;
++		do_div(num, period32);
++		brightness = (num > ESP_C6_PWM_MAX_DUTY) ? ESP_C6_PWM_MAX_DUTY :
++			     (u32)num;
++	}
++
++	/*
++	 * Skip the first apply at probe time. pwm-backlight calls .apply()
++	 * from inside deferred_probe_work, where it races with esp-hosted-NG's
++	 * bluetooth init and other SPI traffic over the shared cmd queue. The
++	 * race intermittently wedges the kernel — measured ~15% boot-freeze
++	 * rate before this skip, 0% after. The C6 slave's BL_DISPLAY_INITIAL_DUTY
++	 * (76) leaves the backlight in a sensible state by default; userspace
++	 * can later set arbitrary brightness via sysfs and those subsequent
++	 * applies run normally.
++	 */
++	if (!priv->probe_apply_skipped) {
++		priv->probe_apply_skipped = true;
++		priv->cached = *state;
++		return 0;
++	}
++
++	ret = cmd_set_backlight(priv->adapter, (u8)brightness);
++	if (ret)
++		return ret;
++
++	priv->cached = *state;
++	return 0;
++}
++
++static int esp_c6_pwm_get_state(struct pwm_chip *chip, struct pwm_device *pwm,
++				struct pwm_state *state)
++{
++	struct esp_c6_pwm *priv = pwmchip_get_drvdata(chip);
++
++	*state = priv->cached;
++	return 0;
++}
++
++static const struct pwm_ops esp_c6_pwm_ops = {
++	.apply = esp_c6_pwm_apply,
++	.get_state = esp_c6_pwm_get_state,
++};
++
++static int esp_c6_pwm_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct esp_adapter *adapter;
++	struct esp_c6_pwm *priv;
++	struct pwm_chip *chip;
++	int ret;
++
++	adapter = esp_hosted_get_ready_adapter();
++	if (!adapter)
++		return -EPROBE_DEFER;
++
++	chip = devm_pwmchip_alloc(dev, 1, sizeof(*priv));
++	if (IS_ERR(chip))
++		return PTR_ERR(chip);
++
++	priv = pwmchip_get_drvdata(chip);
++	priv->adapter = adapter;
++
++	chip->ops = &esp_c6_pwm_ops;
++
++	ret = devm_pwmchip_add(dev, chip);
++	if (ret)
++		return dev_err_probe(dev, ret, "pwmchip_add failed\n");
++
++	dev_info(dev, "esp32-c6 backlight pwm registered (1 channel, slave-fixed 25 kHz)\n");
++	return 0;
++}
++
++static const struct of_device_id esp_c6_pwm_of_match[] = {
++	{ .compatible = "espressif,esp-hosted-pwm" },
++	{ /* sentinel */ }
++};
++MODULE_DEVICE_TABLE(of, esp_c6_pwm_of_match);
++
++static struct platform_driver esp_c6_pwm_driver = {
++	.probe = esp_c6_pwm_probe,
++	.driver = {
++		.name = "esp-hosted-c6-pwm",
++		.of_match_table = esp_c6_pwm_of_match,
++	},
++};
++module_platform_driver(esp_c6_pwm_driver);
++
++MODULE_AUTHOR("WHY2025 Linux port");
++MODULE_DESCRIPTION("ESP32-C6 LEDC backlight PWM via esp-hosted-NG");
++MODULE_LICENSE("GPL");

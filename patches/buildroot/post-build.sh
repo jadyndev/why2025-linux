@@ -1,0 +1,38 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# Buildroot ROOTFS_POST_BUILD_SCRIPT for the WHY2025 badge native-Linux port.
+#
+# Buildroot generates an inittab that respawns getty on /dev/console.
+# Our kernel cmdline lists console=ttyS0 first then console=tty1, so the
+# last entry wins and /dev/console = /dev/tty1 — which means Buildroot's
+# default getty lives on the framebuffer console (the badge's screen),
+# not on the serial UART.
+#
+# We want both: a screen-side shell (for when the KeebDeck CH32V203
+# keyboard support lands in Phase 2) AND a serial-side shell on ttyS0
+# (so `tio` retains an interactive prompt today). Append a respawn for
+# ttyS0 to /etc/inittab; the existing /dev/console respawn (i.e. tty1)
+# stays in place.
+#
+# Idempotent: re-running the script doesn't double the inittab entry.
+set -eu
+
+TARGET_DIR="${1:-${TARGET_DIR:-}}"
+if [ -z "${TARGET_DIR}" ]; then
+    echo "post-build.sh: TARGET_DIR not set" >&2
+    exit 1
+fi
+
+INITTAB="${TARGET_DIR}/etc/inittab"
+LINE="ttyS0::respawn:/sbin/getty -L 115200 ttyS0 vt100"
+
+if [ ! -f "${INITTAB}" ]; then
+    echo "post-build.sh: ${INITTAB} not found" >&2
+    exit 1
+fi
+
+if ! grep -qF "${LINE}" "${INITTAB}"; then
+    printf '\n# WHY2025: serial getty on ttyS0 (in addition to /dev/console = tty1)\n%s\n' \
+        "${LINE}" >> "${INITTAB}"
+fi
